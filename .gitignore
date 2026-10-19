@@ -43,3 +43,6 @@ next-env.d.ts
 # OpenNext / Wrangler generated files
 .open-next/
 .wrangler/
+/src/generated/prisma/
+/.dev.vars
+/.dev.vars.*

@@ -7,6 +7,13 @@
   "compatibility_flags": [
     "nodejs_compat"
   ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "talbista-auth",
+      "database_id": "1fe0aafc-ebc9-4235-8f4f-17bc90d355e6"
+    }
+  ],
   "assets": {
     "directory": ".open-next/assets",
     "binding": "ASSETS"
