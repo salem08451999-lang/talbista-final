@@ -64,6 +64,13 @@ const preflight = await request("/api/login/", {
 assert.equal(preflight.response.status, 204);
 assert.equal(preflight.response.headers.get("access-control-allow-origin"), "capacitor://localhost");
 assert.match(preflight.response.headers.get("access-control-allow-headers") ?? "", /Idempotency-Key/i);
+const pagesPreflight = await request("/api/login", {
+  method: "OPTIONS",
+  origin: "https://talbista.pages.dev",
+  headers: { "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type,authorization" },
+});
+assert.equal(pagesPreflight.response.status, 204);
+assert.equal(pagesPreflight.response.headers.get("access-control-allow-origin"), "https://talbista.pages.dev");
 const deniedPreflight = await request("/api/login", {
   method: "OPTIONS",
   origin: "https://attacker.invalid",
@@ -71,7 +78,7 @@ const deniedPreflight = await request("/api/login", {
 });
 assert.equal(deniedPreflight.response.status, 204);
 assert.equal(deniedPreflight.response.headers.get("access-control-allow-origin"), null);
-pass("health, explicit Capacitor CORS and untrusted-origin denial");
+pass("health, explicit Capacitor/Pages CORS and untrusted-origin denial");
 
 for (let attempt = 0; attempt < 5; attempt += 1) {
   await expect("/api/login/", { method: "POST", body: { phone: credentials.throttled.phone, password: "IncorrectPassword!" } }, 401);
@@ -180,8 +187,8 @@ await expect("/api/push/unsubscribe", {
   body: { endpoint: `https://updates.push.services.mozilla.com/wpush/v2/${stamp}` },
 });
 const fakeFcmToken = `TalbistaIntegrationFakeToken-${stamp}-do-not-send`;
-await expect("/api/devices/register", { method: "POST", token: driverToken, body: { token: fakeFcmToken, channel_v: 5 } });
-const tokenCheck = await expect("/api/devices/register", { method: "POST", token: driverToken, body: { token: fakeFcmToken, channel_v: 5 } });
+await expect("/api/devices/register", { method: "POST", token: driverToken, body: { token: fakeFcmToken, channel_v: 7 } });
+const tokenCheck = await expect("/api/devices/register", { method: "POST", token: driverToken, body: { token: fakeFcmToken, channel_v: 7 } });
 assert.equal(tokenCheck.ok, 1);
 pass("driver application/review/approval, role access, availability, location, finance, ledger, push and device APIs");
 

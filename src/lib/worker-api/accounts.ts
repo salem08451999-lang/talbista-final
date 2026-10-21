@@ -218,7 +218,7 @@ export async function handleAccountApi(ctx: ApiContext): Promise<unknown | typeo
     const token = typeof body.token === "string" ? body.token : "";
     if (token.length < 20 || token.length > 4096) throw new ApiError(400, "bad token");
     const channelVersion = Number(body.channel_v ?? 1);
-    if (![1, 2, 3, 4, 5].includes(channelVersion)) throw new ApiError(400, "invalid channel version");
+    if (![1, 2, 3, 4, 5, 7].includes(channelVersion)) throw new ApiError(400, "invalid channel version");
     await run("INSERT INTO fcm_tokens(token,user_id,created,channel_v) VALUES(?,?,?,?) ON CONFLICT(token) DO UPDATE SET user_id=excluded.user_id,created=excluded.created,channel_v=excluded.channel_v", token, user.id, now(), channelVersion);
     return { ok: 1 };
   }

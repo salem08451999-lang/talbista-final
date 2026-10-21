@@ -11,6 +11,7 @@ export type NotificationOptions = {
 
 function channelFor(version: number, event: string, offer: boolean): string {
   if (version >= 4 && event === "accepted") return "talbista_accepted_v4";
+  if (version >= 7 && (event === "normal" || event === "urgent")) return event === "normal" ? "talbista_normal_v7" : "talbista_urgent_v7";
   if (version >= 5 && (event === "normal" || event === "urgent")) return event === "normal" ? "talbista_normal_v5" : "talbista_urgent_v5";
   if (version >= 3) return ({ normal: "talbista_normal_v3", urgent: "talbista_urgent_v3", delivered: "talbista_delivered_v3" } as Record<string, string>)[event] ?? "talbista_general_v3";
   if (version >= 2) return "talbista_signature_v2";
@@ -45,6 +46,8 @@ export async function notifyUser(userId: number, text: string, options: Notifica
       talbista_accepted_v4: "talbista_accepted",
       talbista_normal_v5: "talbista_offer",
       talbista_urgent_v5: "talbista_urgent",
+      talbista_normal_v7: "talbista_offer_v7",
+      talbista_urgent_v7: "talbista_offer_v7",
       talbista_offer: "talbista_offer",
       talbista_urgent: "talbista_urgent",
       talbista_signature_v2: "talbista_signature_v2",
@@ -52,8 +55,8 @@ export async function notifyUser(userId: number, text: string, options: Notifica
     const androidNotification: Record<string, string> = { channel_id: channel, tag: eventId };
     if (rawSound[channel]) androidNotification.sound = rawSound[channel];
     const apnsSound: Record<string, string> = {
-      normal: "talbista_offer.wav",
-      urgent: "talbista_urgent.wav",
+      normal: "talbista_offer_v7.wav",
+      urgent: "talbista_offer_v7.wav",
       delivered: "talbista_signature_v2.wav",
       accepted: "talbista_accepted.wav",
     };

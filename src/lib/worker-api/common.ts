@@ -26,6 +26,7 @@ export type WorkerBindings = {
 };
 
 const allowedOrigins = new Set([
+  "https://talbista.pages.dev",
   "https://localhost",
   "capacitor://localhost",
   "http://localhost",
