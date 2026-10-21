@@ -42,19 +42,19 @@ export class AuthConfigurationError extends Error {
 export async function withAuthServices<T>(
   operation: (services: AuthServices) => Promise<T>,
 ): Promise<T> {
-  const { env } = getCloudflareContext();
-  const bindings = env as unknown as AuthBindings;
+  const ctx = await getCloudflareContext({ async: true });
+  const env = ctx.env as unknown as AuthBindings;
 
-  if (!bindings.DB) {
+  if (!env?.DB) {
     throw new AuthConfigurationError("D1 binding is not configured");
   }
-  if (!bindings.AUTH_TOKEN_SECRET || bindings.AUTH_TOKEN_SECRET.length < 32) {
+  if (!env.AUTH_TOKEN_SECRET || env.AUTH_TOKEN_SECRET.length < 32) {
     throw new AuthConfigurationError("Auth signing secret is not configured");
   }
 
-  const prisma = new PrismaClient({ adapter: new PrismaD1(bindings.DB) });
+  const prisma = new PrismaClient({ adapter: new PrismaD1(env.DB) });
   try {
-    return await operation({ prisma, tokenSecret: bindings.AUTH_TOKEN_SECRET });
+    return await operation({ prisma, tokenSecret: env.AUTH_TOKEN_SECRET });
   } finally {
     await prisma.$disconnect();
   }
@@ -198,6 +198,7 @@ export async function signAuthToken(
     .setIssuer("talbista-final")
     .setAudience("talbista-app")
     .setSubject(String(user.id))
+    .setJti(crypto.randomUUID())
     .setIssuedAt()
     .setExpirationTime("30d")
     .sign(key);

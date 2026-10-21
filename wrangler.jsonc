@@ -11,7 +11,8 @@
     {
       "binding": "DB",
       "database_name": "talbista-auth",
-      "database_id": "1fe0aafc-ebc9-4235-8f4f-17bc90d355e6"
+      "database_id": "1fe0aafc-ebc9-4235-8f4f-17bc90d355e6",
+      "migrations_dir": "migrations"
     }
   ],
   "assets": {

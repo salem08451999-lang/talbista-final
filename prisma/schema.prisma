@@ -13,4 +13,8 @@ model User {
   phone     String   @unique
   password  String
   createdAt DateTime @default(now())
+  name      String?
+  role      String   @default("CUSTOMER")
+  active    Int      @default(1)
+  photo     String?
 }

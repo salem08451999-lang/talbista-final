@@ -8,14 +8,22 @@ import {
   toPublicUser,
   withAuthServices,
 } from "@/src/lib/auth";
+import { preflight, withCors } from "@/src/lib/worker-api/common";
 
 export const dynamic = "force-dynamic";
+
+const respond = (request: Request, body: Record<string, unknown>, status = 200) =>
+  withCors(request, jsonResponse(body, status));
+
+export function OPTIONS(request: Request): Response {
+  return preflight(request);
+}
 
 export async function POST(request: Request): Promise<Response> {
   const body = await request.json().catch(() => null);
   const parsed = parseCredentials(body);
   if (!parsed.credentials) {
-    return jsonResponse({ ok: false, error: parsed.error }, 400);
+    return respond(request, { ok: false, error: parsed.error }, 400);
   }
 
   try {
@@ -24,7 +32,7 @@ export async function POST(request: Request): Promise<Response> {
         where: { phone: parsed.credentials.phone },
       });
       if (existingUser) {
-        return jsonResponse(
+        return respond(request,
           { ok: false, error: "رقم الهاتف مسجل بالفعل." },
           409,
         );
@@ -39,13 +47,13 @@ export async function POST(request: Request): Promise<Response> {
           },
         });
         const token = await signAuthToken(user, tokenSecret);
-        return jsonResponse(
+        return respond(request,
           { ok: true, user: toPublicUser(user), token },
           201,
         );
       } catch (error) {
         if (isUniqueConstraintError(error)) {
-          return jsonResponse(
+          return respond(request,
             { ok: false, error: "رقم الهاتف مسجل بالفعل." },
             409,
           );
@@ -55,12 +63,12 @@ export async function POST(request: Request): Promise<Response> {
     });
   } catch (error) {
     if (error instanceof AuthConfigurationError) {
-      return jsonResponse(
+      return respond(request,
         { ok: false, error: "خدمة المصادقة غير مهيأة حالياً." },
         503,
       );
     }
-    return jsonResponse(
+    return respond(request,
       { ok: false, error: "تعذر إنشاء الحساب حالياً." },
       500,
     );
