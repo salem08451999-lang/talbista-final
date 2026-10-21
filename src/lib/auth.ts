@@ -14,11 +14,6 @@ type AuthServices = {
   tokenSecret: string;
 };
 
-type Credentials = {
-  phone: string;
-  password: string;
-};
-
 type UserRecord = {
   id: number;
   phone: string;
@@ -40,7 +35,7 @@ export class AuthConfigurationError extends Error {
 }
 
 export async function withAuthServices<T>(
-  operation: (services: AuthServices) => Promise<T>,
+  operation: (services: AuthServices) => Promise<T>
 ): Promise<T> {
   const ctx = await getCloudflareContext({ async: true });
   const env = ctx.env as unknown as AuthBindings;
@@ -48,7 +43,7 @@ export async function withAuthServices<T>(
   if (!env?.DB) {
     throw new AuthConfigurationError("D1 binding is not configured");
   }
-  if (!env.AUTH_TOKEN_SECRET || env.AUTH_TOKEN_SECRET.length < 32) {
+  if (!env?.AUTH_TOKEN_SECRET || env.AUTH_TOKEN_SECRET.length < 32) {
     throw new AuthConfigurationError("Auth signing secret is not configured");
   }
 
@@ -60,88 +55,64 @@ export async function withAuthServices<T>(
   }
 }
 
-export function parseCredentials(value: unknown):
-  | { credentials: Credentials; error?: never }
-  | { credentials?: never; error: string } {
+export function parseCredentials(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { error: "أرسل رقم الهاتف وكلمة المرور فقط." };
+    return { error: "أرسل رقم الهاتف وكلمة المرور فقط." } as const;
   }
-
   const body = value as Record<string, unknown>;
   const keys = Object.keys(body);
+
   if (
     keys.length !== 2 ||
     !Object.prototype.hasOwnProperty.call(body, "phone") ||
     !Object.prototype.hasOwnProperty.call(body, "password")
   ) {
-    return { error: "الحقول المطلوبة هي رقم الهاتف وكلمة المرور فقط." };
+    return { error: "الحقول المطلوبة هي رقم الهاتف وكلمة المرور فقط." } as const;
   }
 
   if (typeof body.phone !== "string" || typeof body.password !== "string") {
-    return { error: "رقم الهاتف وكلمة المرور غير صالحين." };
+    return { error: "رقم الهاتف وكلمة المرور غير صالحين." } as const;
   }
 
   const phone = body.phone.trim().replace(/[\s()-]/g, "");
   if (!/^\+?\d{7,15}$/.test(phone)) {
-    return { error: "أدخل رقم هاتف صحيحاً." };
+    return { error: "أدخل رقم هاتف صحيحاً." } as const;
   }
 
   const passwordBytes = textEncoder.encode(body.password).byteLength;
   if (passwordBytes < 8) {
-    return { error: "يجب أن تتكوّن كلمة المرور من 8 أحرف على الأقل." };
+    return { error: "يجب أن تتكوّن كلمة المرور من 8 أحرف على الأقل." } as const;
   }
   if (passwordBytes > 256) {
-    return { error: "كلمة المرور طويلة جداً." };
+    return { error: "كلمة المرور طويلة جداً." } as const;
   }
 
-  return { credentials: { phone, password: body.password } };
+  return { credentials: { phone, password: body.password } } as const;
 }
 
 function encodeBase64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function decodeBase64Url(value: string): Uint8Array | null {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
   const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
   const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-
   try {
     const binary = atob(padded);
-    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return Uint8Array.from(binary, (c) => c.charCodeAt(0));
   } catch {
     return null;
   }
 }
 
-async function derivePasswordHash(
-  password: string,
-  salt: Uint8Array,
-): Promise<Uint8Array> {
+async function derivePasswordHash(password: string, salt: Uint8Array) {
   const saltBuffer = new ArrayBuffer(salt.byteLength);
   new Uint8Array(saltBuffer).set(salt);
-  const key = await crypto.subtle.importKey(
-    "raw",
-    textEncoder.encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
-  );
-  const derivedBits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      hash: PBKDF2_HASH,
-      salt: saltBuffer,
-      iterations: PBKDF2_ITERATIONS,
-    },
-    key,
-    PASSWORD_HASH_BITS,
-  );
+  const key = await crypto.subtle.importKey("raw", textEncoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const derivedBits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: PBKDF2_HASH, salt: saltBuffer, iterations: PBKDF2_ITERATIONS }, key, PASSWORD_HASH_BITS);
   return new Uint8Array(derivedBits);
 }
 
@@ -151,47 +122,27 @@ export async function hashPassword(password: string): Promise<string> {
   return `${encodeBase64Url(salt)}:${encodeBase64Url(hash)}`;
 }
 
-export async function verifyPassword(
-  password: string,
-  storedValue: string,
-): Promise<boolean> {
+export async function verifyPassword(password: string, storedValue: string): Promise<boolean> {
   const parts = storedValue.split(":");
   if (parts.length !== 2) return false;
-
   const salt = decodeBase64Url(parts[0]);
   const expectedHash = decodeBase64Url(parts[1]);
-  if (
-    !salt ||
-    salt.byteLength !== PASSWORD_SALT_BYTES ||
-    !expectedHash ||
-    expectedHash.byteLength !== PASSWORD_HASH_BYTES
-  ) {
-    return false;
-  }
-
+  if (!salt || salt.byteLength !== PASSWORD_SALT_BYTES || !expectedHash || expectedHash.byteLength !== PASSWORD_HASH_BYTES) return false;
   const actualHash = await derivePasswordHash(password, salt);
-  let difference = 0;
-  for (let index = 0; index < expectedHash.byteLength; index += 1) {
-    difference |= expectedHash[index] ^ actualHash[index];
-  }
-  return difference === 0;
+  let diff = 0;
+  for (let i = 0; i < expectedHash.byteLength; i++) diff |= expectedHash[i] ^ actualHash[i];
+  return diff === 0;
 }
 
 export function toPublicUser(user: UserRecord) {
   return {
     id: user.id,
     phone: user.phone,
-    createdAt:
-      user.createdAt instanceof Date
-        ? user.createdAt.toISOString()
-        : new Date(user.createdAt).toISOString(),
+    createdAt: user.createdAt instanceof Date ? user.createdAt.toISOString() : new Date(user.createdAt).toISOString(),
   };
 }
 
-export async function signAuthToken(
-  user: Pick<UserRecord, "id" | "phone">,
-  secret: string,
-): Promise<string> {
+export async function signAuthToken(user: Pick<UserRecord, "id" | "phone">, secret: string): Promise<string> {
   const key = textEncoder.encode(secret);
   return new SignJWT({ phone: user.phone })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
@@ -204,21 +155,11 @@ export async function signAuthToken(
     .sign(key);
 }
 
-export async function verifyAuthToken(
-  token: string,
-  secret: string,
-): Promise<number> {
+export async function verifyAuthToken(token: string, secret: string): Promise<number> {
   const key = textEncoder.encode(secret);
-  const { payload } = await jwtVerify(token, key, {
-    algorithms: ["HS256"],
-    issuer: "talbista-final",
-    audience: "talbista-app",
-  });
-
+  const { payload } = await jwtVerify(token, key, { algorithms: ["HS256"], issuer: "talbista-final", audience: "talbista-app" });
   const userId = Number(payload.sub);
-  if (!Number.isSafeInteger(userId) || userId < 1) {
-    throw new Error("Invalid token subject");
-  }
+  if (!Number.isSafeInteger(userId) || userId < 1) throw new Error("Invalid token subject");
   return userId;
 }
 
@@ -231,22 +172,9 @@ export function getBearerToken(request: Request): string | null {
 export function isUniqueConstraintError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const candidate = error as { code?: unknown; message?: unknown };
-  return (
-    candidate.code === "P2002" ||
-    (typeof candidate.message === "string" &&
-      /unique constraint failed/i.test(candidate.message))
-  );
+  return candidate.code === "P2002" || (typeof candidate.message === "string" && /unique constraint failed/i.test(candidate.message));
 }
 
-export function jsonResponse(
-  value: Record<string, unknown>,
-  status = 200,
-): Response {
-  return Response.json(value, {
-    status,
-    headers: {
-      "Cache-Control": "no-store",
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
+export function jsonResponse(value: Record<string, unknown>, status = 200): Response {
+  return Response.json(value, { status, headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
 }
