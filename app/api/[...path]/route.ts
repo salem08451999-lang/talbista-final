@@ -3,6 +3,7 @@ import { handleAccountApi } from "@/src/lib/worker-api/accounts";
 import { handleOrderApi } from "@/src/lib/worker-api/orders";
 import { handleDriverApi } from "@/src/lib/worker-api/driver";
 import { handleAdminApi } from "@/src/lib/worker-api/admin";
+import { handleChatApi } from "@/src/lib/worker-api/chat";
 import { withIdempotency } from "@/src/lib/worker-api/idempotency";
 
 export const dynamic = "force-dynamic";
@@ -17,7 +18,7 @@ async function handle(request: Request): Promise<Response> {
     let body: Record<string, unknown> = {};
     if (!["GET", "HEAD"].includes(method)) body = await readJson(request, 1_300_000);
     const ctx = { request, method, path, body };
-    const handlers = [handleAccountApi, handleOrderApi, handleDriverApi, handleAdminApi];
+    const handlers = [handleAccountApi, handleChatApi, handleOrderApi, handleDriverApi, handleAdminApi];
     for (const handler of handlers) {
       const result = await withIdempotency(request, method, path, body, () => handler(ctx));
       if (typeof result !== "symbol") return withCors(request, json(result));

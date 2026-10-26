@@ -15,6 +15,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "طلبيستا — تسجيل الدخول",
   description: "تسجيل الدخول إلى حساب طلبيستا باستخدام رقم الهاتف وكلمة المرور.",
+  manifest: "/manifest.webmanifest",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

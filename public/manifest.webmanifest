@@ -1,0 +1,28 @@
+{
+  "id": "/",
+  "name": "Talbista Benghazi — توصيل",
+  "short_name": "Talbista",
+  "description": "خدمة توصيل محلية في بنغازي",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "background_color": "#0a1a14",
+  "theme_color": "#0a1a14",
+  "icons": [
+    {
+      "src": "/icons/talbista-512-any.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/talbista-512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
