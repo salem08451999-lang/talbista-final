@@ -374,10 +374,15 @@ export async function driverOrders(user: MobileUser): Promise<Record<string, unk
 }
 
 export async function driverOfferList(userId: number): Promise<Record<string, unknown>[]> {
-  return all(`SELECT f.order_id,f.expires,f.distance_m,COALESCE(o.agreed_price,o.delivery_price) agreed_price,o.loyalty_reward_id,o.urgent,o.pickup,o.dropoff,o.details,o.kind,o.order_value,o.is_paid,o.notes,
+  const activeOrder = await first<{ id: number }>("SELECT id FROM orders WHERE driver_id=? AND status NOT IN ('DELIVERED','CANCELLED') ORDER BY id DESC LIMIT 1", userId);
+  const driverActiveOrderId = activeOrder ? Number(activeOrder.id) : null;
+  const orders = await all<Record<string, unknown>>(`SELECT f.order_id,f.expires,f.distance_m,COALESCE(o.agreed_price,o.delivery_price) agreed_price,o.loyalty_reward_id,o.urgent,o.pickup,o.dropoff,o.details,o.kind,o.order_value,o.is_paid,o.notes,
     CASE WHEN o.kind='STORE' THEN s.store_name END store_name,CASE WHEN o.kind='STORE' THEN s.address END store_address
     FROM offers f JOIN orders o ON o.id=f.order_id LEFT JOIN stores s ON s.user_id=o.customer_id
-    WHERE f.driver_id=? AND f.status='PENDING'`, userId);
+    WHERE f.driver_id=? AND f.status='PENDING' AND o.status='SEARCHING_DRIVER' AND o.driver_id IS NULL AND (? IS NULL OR o.id<>?)
+    ORDER BY o.created DESC,o.id DESC`, userId, driverActiveOrderId, driverActiveOrderId);
+  console.log('[NEARBY_FILTER] returning', orders.length, 'orders, active:', driverActiveOrderId);
+  return orders;
 }
 
 export async function dispatchNewOrders(): Promise<void> {
