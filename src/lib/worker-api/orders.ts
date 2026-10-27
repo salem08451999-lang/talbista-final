@@ -165,6 +165,17 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     if (!(await first("SELECT 1 AS found FROM services WHERE id=? AND active=1", serviceId))) throw new ApiError(400, "bad service");
     const [pickupLat, pickupLng] = coordinates(body, "pickup_lat", "pickup_lng");
     const [dropoffLat, dropoffLng] = coordinates(body, "dropoff_lat", "dropoff_lng");
+    const createdAt = now();
+    if (pickupLat != null && pickupLng != null && dropoffLat != null && dropoffLng != null) {
+      const lastOrder = await first<{ id: number }>(`SELECT id FROM orders
+        WHERE customer_id=? AND pickup_lat=? AND pickup_lng=? AND dropoff_lat=? AND dropoff_lng=?
+          AND created>=? AND created<=?
+        ORDER BY created DESC, id DESC LIMIT 1`, user.id, pickupLat, pickupLng, dropoffLat, dropoffLng, createdAt - 30, createdAt);
+      if (lastOrder) {
+        console.log("[DUPLICATE_GUARD] blocked duplicate for customer", user.id);
+        return { ok: true, existingId: Number(lastOrder.id) };
+      }
+    }
     const urgent = body.urgent ? 1 : 0;
     if (!urgent && !normalWindowOpen()) throw new ApiError(409, "orders not available now");
     const details = typeof body.details === "string" ? body.details.trim().slice(0, 500) : "";
@@ -173,7 +184,7 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     if (useReward && !reward) throw new ApiError(409, "لا توجد مكافأة توصيل متاحة");
     const commission = moneyToUnits(await setting(urgent ? "commission_urgent" : "commission_normal"));
     const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,delivery_price,agreed_price,price_source,commission)
-      VALUES(?,?,?,?,?,?, 'NEW', ?,?,?,?,?,NULL,NULL,NULL,?)`, user.id, serviceId, String(body.pickup).slice(0, 200), String(body.dropoff).slice(0, 200), details, urgent, now(), pickupLat, pickupLng, dropoffLat, dropoffLng, commission);
+      VALUES(?,?,?,?,?,?, 'NEW', ?,?,?,?,?,NULL,NULL,NULL,?)`, user.id, serviceId, String(body.pickup).slice(0, 200), String(body.dropoff).slice(0, 200), details, urgent, createdAt, pickupLat, pickupLng, dropoffLat, dropoffLng, commission);
     const orderId = inserted.lastRowId;
     if (orderId == null) throw new ApiError(500, "server error");
     if (reward) {
