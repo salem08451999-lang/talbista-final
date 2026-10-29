@@ -7,8 +7,21 @@ import { notifyUser } from "./notifications";
 const terminal = ["DELIVERED", "CANCELLED"] as const;
 const priceResponseTimeout = 30;
 
+async function randomDeliveryCode(): Promise<number> {
+  const existing = await all<{ delivery_code: number }>("SELECT delivery_code FROM orders WHERE status NOT IN ('DELIVERED','CANCELLED')");
+  const used = new Set(existing.map((row) => Number(row.delivery_code)));
+  const value = new Uint32Array(1);
+  const limit = Math.floor(0x1_0000_0000 / 9000) * 9000;
+  for (let attempt = 0; attempt < 128; attempt++) {
+    do { crypto.getRandomValues(value); } while (value[0] >= limit);
+    const code = 1000 + (value[0] % 9000);
+    if (!used.has(code)) return code;
+  }
+  throw new ApiError(503, "delivery code space unavailable");
+}
+
 type Order = {
-  id: number; customer_id: number; service_id: number | null; pickup: string; dropoff: string;
+  id: number; customer_id: number; delivery_code: number; idempotency_key: string | null; service_id: number | null; pickup: string; dropoff: string;
   details: string | null; urgent: number; status: string; driver_id: number | null;
   agreed_price: number | null; delivery_price: number | null; created: number; confirmed: number;
   proposed_price: number | null; price_status: string; kind: string | null; contact: string | null;
@@ -141,6 +154,7 @@ export async function orderView(order: Order, viewer?: MobileUser): Promise<Reco
   const result: Record<string, unknown> = { ...order, agreed_price: order.agreed_price ?? order.delivery_price };
   delete result.delivery_fee;
   delete result.delivery_price;
+  if (viewer?.role !== "ADMIN" && viewer?.role !== "CUSTOMER") delete result.delivery_code;
   result.history = await all("SELECT status,at FROM order_status_history WHERE order_id=? ORDER BY id", order.id);
   result.driver = null;
   if (order.driver_id) {
@@ -158,24 +172,34 @@ function roundedPrice(value: unknown): number {
   return Math.round(amount * 1000) / 1000;
 }
 
+type IdempotentOrder = { id: number; customer_id: number; delivery_code: number; status: string };
+
+async function findIdempotentOrder(key: string, customerId: number): Promise<IdempotentOrder | null> {
+  return first<IdempotentOrder>("SELECT id,customer_id,delivery_code,status FROM orders WHERE idempotency_key=? AND customer_id=? LIMIT 1", key, customerId);
+}
+
+async function idempotentOrderResponse(order: IdempotentOrder, user: MobileUser) {
+  const existing = await first<Order>("SELECT * FROM orders WHERE id=? AND customer_id=?", order.id, user.id);
+  if (!existing) throw new ApiError(404, "not found");
+  const id = Number(existing.id);
+  return { ok: true, id, existingId: id, delivery_code: Number(existing.delivery_code), status: existing.status, order: await orderView(existing, user) };
+}
+
 async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
   if (user.role === "CUSTOMER") {
+    const idempotencyKey = typeof body.idempotency_key === "string" ? body.idempotency_key.trim() : "";
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(idempotencyKey)) throw new ApiError(400, "missing or invalid idempotency_key");
+    const previousOrder = await findIdempotentOrder(idempotencyKey, user.id);
+    if (previousOrder) {
+      console.log(`[DUPLICATE_GUARD] blocked duplicate for customer ${user.id}`);
+      return idempotentOrderResponse(previousOrder, user);
+    }
     if (body.service_id == null || body.pickup == null || body.dropoff == null) throw new ApiError(400, "missing service_id/pickup/dropoff");
     const serviceId = asNumber(body.service_id, "service_id", 1);
     if (!(await first("SELECT 1 AS found FROM services WHERE id=? AND active=1", serviceId))) throw new ApiError(400, "bad service");
     const [pickupLat, pickupLng] = coordinates(body, "pickup_lat", "pickup_lng");
     const [dropoffLat, dropoffLng] = coordinates(body, "dropoff_lat", "dropoff_lng");
     const createdAt = now();
-    if (pickupLat != null && pickupLng != null && dropoffLat != null && dropoffLng != null) {
-      const lastOrder = await first<{ id: number }>(`SELECT id FROM orders
-        WHERE customer_id=? AND pickup_lat=? AND pickup_lng=? AND dropoff_lat=? AND dropoff_lng=?
-          AND created>=? AND created<=?
-        ORDER BY created DESC, id DESC LIMIT 1`, user.id, pickupLat, pickupLng, dropoffLat, dropoffLng, createdAt - 30, createdAt);
-      if (lastOrder) {
-        console.log("[DUPLICATE_GUARD] blocked duplicate for customer", user.id);
-        return { ok: true, existingId: Number(lastOrder.id) };
-      }
-    }
     const urgent = body.urgent ? 1 : 0;
     if (!urgent && !normalWindowOpen()) throw new ApiError(409, "orders not available now");
     const details = typeof body.details === "string" ? body.details.trim().slice(0, 500) : "";
@@ -183,9 +207,21 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     const reward = useReward ? await first<{ id: number }>("SELECT * FROM loyalty_rewards WHERE owner_kind='CUSTOMER' AND owner_id=? AND reward_type='CUSTOMER_FREE_DELIVERY' AND status='AVAILABLE' ORDER BY earned_at,id LIMIT 1", user.id) : null;
     if (useReward && !reward) throw new ApiError(409, "لا توجد مكافأة توصيل متاحة");
     const commission = moneyToUnits(await setting(urgent ? "commission_urgent" : "commission_normal"));
-    const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,delivery_price,agreed_price,price_source,commission)
-      VALUES(?,?,?,?,?,?, 'NEW', ?,?,?,?,?,NULL,NULL,NULL,?)`, user.id, serviceId, String(body.pickup).slice(0, 200), String(body.dropoff).slice(0, 200), details, urgent, createdAt, pickupLat, pickupLng, dropoffLat, dropoffLng, commission);
-    const orderId = inserted.lastRowId;
+    let orderId: number | null = null;
+    try {
+      const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,delivery_price,agreed_price,price_source,commission,idempotency_key,delivery_code)
+        VALUES(?,?,?,?,?,?, 'NEW', ?,?,?,?,?,NULL,NULL,NULL,?,?,?)`, user.id, serviceId, String(body.pickup).slice(0, 200), String(body.dropoff).slice(0, 200), details, urgent, createdAt, pickupLat, pickupLng, dropoffLat, dropoffLng, commission, idempotencyKey, await randomDeliveryCode());
+      orderId = inserted.lastRowId == null ? null : Number(inserted.lastRowId);
+    } catch (error) {
+      const racedOrder = await findIdempotentOrder(idempotencyKey, user.id);
+      if (!racedOrder) {
+        const keyOwner = await first("SELECT 1 AS found FROM orders WHERE idempotency_key=? LIMIT 1", idempotencyKey);
+        if (keyOwner) throw new ApiError(409, "idempotency key already used");
+        throw error;
+      }
+      console.log(`[DUPLICATE_GUARD] blocked duplicate for customer ${user.id}`);
+      return idempotentOrderResponse(racedOrder, user);
+    }
     if (orderId == null) throw new ApiError(500, "server error");
     if (reward) {
       await run("UPDATE orders SET loyalty_reward_id=? WHERE id=?", reward.id, orderId);
@@ -198,7 +234,7 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     await notifyUser(user.id, `تم إنشاء الطلب #${orderId}`, { orderId });
     await setStatus(order, "SEARCHING_DRIVER", user.id);
     await dispatch();
-    return { id: orderId, note: "سعر التنفيذ يتم الاتفاق عليه بين العميل والسائق قبل التأكيد" };
+    return { ok: true, id: orderId, delivery_code: Number(order.delivery_code), note: "سعر التنفيذ يتم الاتفاق عليه بين العميل والسائق قبل التأكيد" };
   }
 
   if (user.role === "STORE") {
@@ -234,12 +270,17 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
 export async function handleOrderApi(ctx: ApiContext): Promise<unknown | typeof NO_ROUTE> {
   const { method, path, body } = ctx;
 
-  if (method === "GET" && path === "/api/orders") {
+  if (method === "GET" && (path === "/api/orders" || path === "/api/customer/orders")) {
     const user = await apiUser(ctx, ["CUSTOMER"]);
     const rows = await all<Order>("SELECT * FROM orders WHERE customer_id=? ORDER BY id DESC", user.id);
     return Promise.all(rows.map((order) => orderView(order, user)));
   }
   if (method === "POST" && path === "/api/orders") return orderCreate(await apiUser(ctx, ["CUSTOMER"]), body);
+  const customerOrderMatch = path.match(/^\/api\/customer\/orders\/(\d+)$/);
+  if (method === "GET" && customerOrderMatch) {
+    const user = await apiUser(ctx, ["CUSTOMER"]);
+    return orderView(await getOrder(Number(customerOrderMatch[1]), user), user);
+  }
   const orderIdMatch = path.match(/^\/api\/orders\/(\d+)$/);
   if (method === "GET" && orderIdMatch) {
     const user = await apiUser(ctx);

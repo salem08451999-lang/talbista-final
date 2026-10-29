@@ -5,6 +5,7 @@ import { handleDriverApi } from "@/src/lib/worker-api/driver";
 import { handleAdminApi } from "@/src/lib/worker-api/admin";
 import { handleChatApi } from "@/src/lib/worker-api/chat";
 import { withIdempotency } from "@/src/lib/worker-api/idempotency";
+import { currentMobileUser } from "@/src/lib/worker-api/session";
 
 export const dynamic = "force-dynamic";
 
@@ -16,11 +17,15 @@ async function handle(request: Request): Promise<Response> {
   const method = request.method.toUpperCase();
   try {
     let body: Record<string, unknown> = {};
-    if (!["GET", "HEAD"].includes(method)) body = await readJson(request, 1_300_000);
+    if (! ["GET", "HEAD"].includes(method)) body = await readJson(request, 1_300_000);
     const ctx = { request, method, path, body };
     const handlers = [handleAccountApi, handleChatApi, handleOrderApi, handleDriverApi, handleAdminApi];
+    const customerOrderUsesDatabaseKey = method === "POST" && path === "/api/orders"
+      && (await currentMobileUser(request)).role === "CUSTOMER";
     for (const handler of handlers) {
-      const result = await withIdempotency(request, method, path, body, () => handler(ctx));
+      const result = customerOrderUsesDatabaseKey
+        ? await handler(ctx)
+        : await withIdempotency(request, method, path, body, () => handler(ctx));
       if (typeof result !== "symbol") return withCors(request, json(result));
     }
     return withCors(request, json({ error: "not found" }, 404));

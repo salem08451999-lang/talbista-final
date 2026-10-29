@@ -93,6 +93,30 @@ export async function handleDriverApi(ctx: ApiContext): Promise<unknown | typeof
     const previous = flow.indexOf(order.status as typeof flow[number]);
     const next = flow.indexOf(status as typeof flow[number]);
     if (previous < 0 || next !== previous + 1) throw new ApiError(409, "invalid transition");
+    if (status === "DELIVERED" && order.kind !== "STORE") {
+      const code = typeof body.delivery_code === "string" ? body.delivery_code.trim() : "";
+      if (!/^\d{4}$/.test(code)) throw new ApiError(400, "أدخل رمز الاستلام المكون من 4 أرقام");
+      const timestamp = now();
+      const current = await first<{ delivery_code: number; delivery_code_locked_until: number }>(
+        "SELECT delivery_code,delivery_code_locked_until FROM orders WHERE id=? AND driver_id=? AND status='DRIVER_ARRIVED_DESTINATION'",
+        order.id, user.id,
+      );
+      if (!current) throw new ApiError(409, "حالة الطلب تغيرت؛ حدّث القائمة");
+      if (Number(current.delivery_code_locked_until) > timestamp) throw new ApiError(429, "محاولات كثيرة؛ انتظر 5 دقائق ثم حاول مجددًا");
+      if (Number(current.delivery_code) !== Number(code)) {
+        await run(`UPDATE orders SET delivery_code_attempts=delivery_code_attempts+1,
+          delivery_code_locked_until=CASE WHEN delivery_code_attempts+1>=5 THEN ? ELSE delivery_code_locked_until END
+          WHERE id=? AND driver_id=? AND status='DRIVER_ARRIVED_DESTINATION' AND delivery_code_locked_until<=?`,
+        timestamp + 300, order.id, user.id, timestamp);
+        const updated = await first<{ delivery_code_locked_until: number }>("SELECT delivery_code_locked_until FROM orders WHERE id=?", order.id);
+        if (Number(updated?.delivery_code_locked_until ?? 0) > timestamp) throw new ApiError(429, "محاولات كثيرة؛ انتظر 5 دقائق ثم حاول مجددًا");
+        throw new ApiError(400, "رمز الاستلام غير صحيح");
+      }
+      const verified = await run(`UPDATE orders SET delivery_code_verified_at=?,delivery_code_attempts=0,delivery_code_locked_until=0
+        WHERE id=? AND driver_id=? AND status='DRIVER_ARRIVED_DESTINATION' AND delivery_code=? AND delivery_code_locked_until<=?`,
+      timestamp, order.id, user.id, Number(code), timestamp);
+      if (!verified.changes) throw new ApiError(409, "تعذر تأكيد الرمز؛ حدّث الطلب وحاول مجددًا");
+    }
     await applyOrderStatus(order, status as string, user.id);
     return { ok: 1 };
   }

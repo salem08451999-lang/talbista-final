@@ -229,7 +229,8 @@ export async function handleAdminApi(ctx: ApiContext): Promise<unknown | typeof 
 
   if (method === "GET" && path === "/api/admin/orders") {
     const { orderView } = await import("./orders");
-    const rows = await all("SELECT * FROM orders ORDER BY id DESC");
+    const rows = await all<Record<string, unknown> & { customer_name: string | null }>(`SELECT o.*,u.name AS customer_name FROM orders o
+      LEFT JOIN "User" u ON u.id=o.customer_id ORDER BY o.id DESC`);
     return Promise.all(rows.map((row) => orderView(row as never, user)));
   }
   const orderMatch = path.match(/^\/api\/admin\/orders\/(\d+)(?:\/(assign|cancel|price-history))?$/);
