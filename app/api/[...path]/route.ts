@@ -4,6 +4,7 @@ import { handleOrderApi } from "@/src/lib/worker-api/orders";
 import { handleDriverApi } from "@/src/lib/worker-api/driver";
 import { handleAdminApi } from "@/src/lib/worker-api/admin";
 import { handleChatApi } from "@/src/lib/worker-api/chat";
+import { handleLocationApi } from "@/src/lib/worker-api/location";
 import { withIdempotency } from "@/src/lib/worker-api/idempotency";
 import { currentMobileUser } from "@/src/lib/worker-api/session";
 
@@ -19,7 +20,7 @@ async function handle(request: Request): Promise<Response> {
     let body: Record<string, unknown> = {};
     if (! ["GET", "HEAD"].includes(method)) body = await readJson(request, 1_300_000);
     const ctx = { request, method, path, body };
-    const handlers = [handleAccountApi, handleChatApi, handleOrderApi, handleDriverApi, handleAdminApi];
+    const handlers = [handleAccountApi, handleChatApi, handleLocationApi, handleOrderApi, handleDriverApi, handleAdminApi];
     const customerOrderUsesDatabaseKey = method === "POST" && path === "/api/orders"
       && (await currentMobileUser(request)).role === "CUSTOMER";
     for (const handler of handlers) {

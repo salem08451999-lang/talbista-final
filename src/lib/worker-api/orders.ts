@@ -1,8 +1,10 @@
 import { ApiError, all, asNumber, coordinates, first, now, run, type MobileUser } from "./common";
 import { ApiContext, apiUser, NO_ROUTE } from "./accounts";
-import { balance, moneyToUnits, postLedger } from "./ledger";
+import { balance, moneyToUnits, postLedger, unitsToMoney } from "./ledger";
 import { completeLoyaltyOrder, releaseOrderReward, syncStoreReward } from "./loyalty";
 import { notifyUser } from "./notifications";
+import { calculateRouteQuote, consumeEstimateQuota, routeProviderReady } from "./location";
+import { shouldRecalculateRouteQuote } from "./location-pricing";
 
 const terminal = ["DELIVERED", "CANCELLED"] as const;
 const priceResponseTimeout = 30;
@@ -27,6 +29,8 @@ type Order = {
   proposed_price: number | null; price_status: string; kind: string | null; contact: string | null;
   order_value: number | null; is_paid: number | null; delivery_fee: number | null; notes: string | null;
   pickup_lat: number | null; pickup_lng: number | null; dropoff_lat: number | null; dropoff_lng: number | null;
+  pickup_name: string | null; dropoff_name: string | null; route_distance_m: number | null;
+  max_price: number | null; customer_offer_price: number | null; female_driver_only: number; private_ride: number;
   price_source: string | null; commission: number | null; loyalty_reward_id: number | null; is_demo: number | null;
   price_expires: number | null;
 };
@@ -57,21 +61,28 @@ function formatDistance(meters: number): string {
   return meters >= 1000 ? `${(meters / 1000).toFixed(1)} كم` : `${Math.round(meters / 10) * 10} متر`;
 }
 
-async function eligibleDrivers(orderId: number, timestamp: number) {
+async function eligibleDrivers(orderId: number, timestamp: number, femaleOnly = false, privateRide = false) {
   const cap = await setting("custody_cap");
   const maxActive = await setting("max_active_orders");
   return all<{ id: number; lat: number | null; lng: number | null; loc_at: number; last_offer: number }>(
     `SELECT u.id,d.lat,d.lng,d.loc_at,d.last_offer FROM "User" u JOIN drivers d ON d.user_id=u.id
      WHERE u.active=1 AND u.role='DRIVER' AND d.available=1 AND d.outstanding<? AND d.blocked_until<=?
+       AND (?=0 OR d.gender='female')
        AND (SELECT COUNT(*) FROM orders x WHERE x.driver_id=u.id AND x.status NOT IN ('DELIVERED','CANCELLED'))
          +(SELECT COUNT(*) FROM offers p WHERE p.driver_id=u.id AND p.status='PENDING') < ?
+       AND NOT EXISTS(SELECT 1 FROM orders x WHERE x.driver_id=u.id AND x.status NOT IN ('DELIVERED','CANCELLED') AND x.private_ride=1)
+       AND NOT EXISTS(SELECT 1 FROM offers pf JOIN orders po ON po.id=pf.order_id WHERE pf.driver_id=u.id AND pf.status='PENDING' AND po.private_ride=1)
+       AND (?=0 OR (
+         NOT EXISTS(SELECT 1 FROM orders x WHERE x.driver_id=u.id AND x.status NOT IN ('DELIVERED','CANCELLED'))
+         AND NOT EXISTS(SELECT 1 FROM offers p WHERE p.driver_id=u.id AND p.status='PENDING')
+       ))
        AND NOT EXISTS(SELECT 1 FROM offers f WHERE f.driver_id=u.id AND f.order_id=? AND f.status='PENDING')`,
-    cap, timestamp, maxActive, orderId,
+    cap, timestamp, femaleOnly ? 1 : 0, maxActive, privateRide ? 1 : 0, orderId,
   );
 }
 
-async function selectDriver(order: Pick<Order, "id" | "pickup_lat" | "pickup_lng">, timestamp: number): Promise<{ id: number; distance: number | null } | null> {
-  const drivers = await eligibleDrivers(order.id, timestamp);
+async function selectDriver(order: Pick<Order, "id" | "pickup_lat" | "pickup_lng" | "female_driver_only" | "private_ride">, timestamp: number): Promise<{ id: number; distance: number | null } | null> {
+  const drivers = await eligibleDrivers(order.id, timestamp, Boolean(order.female_driver_only), Boolean(order.private_ride));
   if (order.pickup_lat != null && order.pickup_lng != null) {
     const freshAge = await setting("location_max_age");
     const fresh = drivers.filter((driver) => driver.lat != null && driver.lng != null && Number(driver.loc_at) >= timestamp - freshAge);
@@ -105,7 +116,13 @@ async function dispatch(): Promise<void> {
   await expirePriceProposals(timestamp);
   if ((await setting("auto_dispatch")) === 0) return;
   await run("UPDATE offers SET status='EXPIRED' WHERE status='PENDING' AND expires<?", timestamp);
-  const orders = await all<Order>("SELECT * FROM orders WHERE status='SEARCHING_DRIVER' ORDER BY urgent DESC,id LIMIT 100");
+  await run(`UPDATE offers SET status='CANCELLED' WHERE status='PENDING' AND order_id IN (
+    SELECT o.id FROM orders o WHERE o.status='SEARCHING_DRIVER' AND (o.kind IS NULL OR o.kind<>'STORE') AND o.service_id IS NOT NULL
+      AND NOT EXISTS(SELECT 1 FROM services s WHERE s.id=o.service_id AND s.active=1)
+  )`);
+  const orders = await all<Order>(`SELECT * FROM orders o WHERE o.status='SEARCHING_DRIVER'
+    AND (o.kind='STORE' OR o.service_id IS NULL OR EXISTS(SELECT 1 FROM services s WHERE s.id=o.service_id AND s.active=1))
+    ORDER BY o.urgent DESC,o.id LIMIT 100`);
   for (const order of orders) {
     if (await first("SELECT 1 AS found FROM offers WHERE order_id=? AND status='PENDING'", order.id)) continue;
     const candidate = await selectDriver(order, timestamp);
@@ -152,6 +169,9 @@ async function getOrder(orderId: number, user: MobileUser): Promise<Order> {
 
 export async function orderView(order: Order, viewer?: MobileUser): Promise<Record<string, unknown>> {
   const result: Record<string, unknown> = { ...order, agreed_price: order.agreed_price ?? order.delivery_price };
+  result.max_price = order.max_price == null ? null : unitsToMoney(Number(order.max_price));
+  result.customer_offer_price = order.customer_offer_price == null ? null : unitsToMoney(Number(order.customer_offer_price));
+  result.route_distance_km = order.route_distance_m == null ? null : Math.round(Number(order.route_distance_m) / 10) / 100;
   delete result.delivery_fee;
   delete result.delivery_price;
   if (viewer?.role !== "ADMIN" && viewer?.role !== "CUSTOMER") delete result.delivery_code;
@@ -170,6 +190,20 @@ export async function orderView(order: Order, viewer?: MobileUser): Promise<Reco
 function roundedPrice(value: unknown): number {
   const amount = asNumber(value, "price", Number.MIN_VALUE, 10_000);
   return Math.round(amount * 1000) / 1000;
+}
+
+function strictFlag(body: Record<string, unknown>, key: string): boolean {
+  const value = body[key];
+  if (value === undefined) return false;
+  if (typeof value !== "boolean") throw new ApiError(400, `invalid ${key}`);
+  return value;
+}
+
+function locationLabel(value: unknown, fallback: unknown, field: string): string {
+  if (value != null && typeof value !== "string") throw new ApiError(400, `invalid ${field}`);
+  const label = typeof value === "string" ? value.trim() : String(fallback ?? "").trim();
+  if (label.length < 1 || label.length > 200) throw new ApiError(400, `invalid ${field}`);
+  return label;
 }
 
 type IdempotentOrder = { id: number; customer_id: number; delivery_code: number; status: string };
@@ -199,6 +233,28 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     if (!(await first("SELECT 1 AS found FROM services WHERE id=? AND active=1", serviceId))) throw new ApiError(400, "bad service");
     const [pickupLat, pickupLng] = coordinates(body, "pickup_lat", "pickup_lng");
     const [dropoffLat, dropoffLng] = coordinates(body, "dropoff_lat", "dropoff_lng");
+    const pickupName = locationLabel(body.pickup_name, body.pickup, "pickup_name");
+    const dropoffName = locationLabel(body.dropoff_name, body.dropoff, "dropoff_name");
+    const autoPricing = strictFlag(body, "auto_pricing");
+    const femaleOnly = strictFlag(body, "female_driver_only");
+    const privateRide = strictFlag(body, "private_ride");
+    let routeDistanceM: number | null = null;
+    let maxPriceUnits: number | null = null;
+    let customerOfferUnits: number | null = null;
+    // Once routing is configured, every customer order must be priced from the
+    // server-side road distance; the browser flag is never an authorization bypass.
+    const routingReady = routeProviderReady();
+    if (shouldRecalculateRouteQuote(user.role, routingReady, autoPricing, femaleOnly)) {
+      if (pickupLat == null || pickupLng == null || dropoffLat == null || dropoffLng == null) throw new ApiError(400, "اختر موقعي الاستلام والتسليم قبل حساب السعر");
+      await consumeEstimateQuota(user.id);
+      const quote = await calculateRouteQuote({ pickup_lat: pickupLat, pickup_lng: pickupLng, dropoff_lat: dropoffLat, dropoff_lng: dropoffLng }, femaleOnly);
+      const minUnits = moneyToUnits(quote.min_price);
+      maxPriceUnits = moneyToUnits(quote.max_price);
+      const requestedOffer = body.customer_offer_price == null ? quote.max_price : asNumber(body.customer_offer_price, "customer_offer_price", quote.min_price, quote.max_price);
+      customerOfferUnits = moneyToUnits(requestedOffer);
+      if (customerOfferUnits < minUnits || customerOfferUnits > maxPriceUnits) throw new ApiError(400, "قيمة المساومة خارج النطاق المسموح");
+      routeDistanceM = quote.distance_m;
+    }
     const createdAt = now();
     const urgent = body.urgent ? 1 : 0;
     if (!urgent && !normalWindowOpen()) throw new ApiError(409, "orders not available now");
@@ -209,8 +265,8 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     const commission = moneyToUnits(await setting(urgent ? "commission_urgent" : "commission_normal"));
     let orderId: number | null = null;
     try {
-      const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,delivery_price,agreed_price,price_source,commission,idempotency_key,delivery_code)
-        VALUES(?,?,?,?,?,?, 'NEW', ?,?,?,?,?,NULL,NULL,NULL,?,?,?)`, user.id, serviceId, String(body.pickup).slice(0, 200), String(body.dropoff).slice(0, 200), details, urgent, createdAt, pickupLat, pickupLng, dropoffLat, dropoffLng, commission, idempotencyKey, await randomDeliveryCode());
+      const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,pickup_name,dropoff_name,route_distance_m,max_price,customer_offer_price,female_driver_only,private_ride,delivery_price,agreed_price,price_source,commission,idempotency_key,delivery_code)
+        VALUES(?,?,?,?,?,?, 'NEW', ?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?)`, user.id, serviceId, String(body.pickup).slice(0, 200), String(body.dropoff).slice(0, 200), details, urgent, createdAt, pickupLat, pickupLng, dropoffLat, dropoffLng, pickupName, dropoffName, routeDistanceM, maxPriceUnits, customerOfferUnits, femaleOnly ? 1 : 0, privateRide ? 1 : 0, commission, idempotencyKey, await randomDeliveryCode());
       orderId = inserted.lastRowId == null ? null : Number(inserted.lastRowId);
     } catch (error) {
       const racedOrder = await findIdempotentOrder(idempotencyKey, user.id);
@@ -249,11 +305,13 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     const pickupLat = providedLat ?? (store.lat == null ? null : Number(store.lat));
     const pickupLng = providedLng ?? (store.lng == null ? null : Number(store.lng));
     const [dropoffLat, dropoffLng] = coordinates(body, "dropoff_lat", "dropoff_lng");
+    const pickupName = locationLabel(body.pickup_name, body.pickup ?? store.address, "pickup_name");
+    const dropoffName = locationLabel(body.dropoff_name, body.dropoff, "dropoff_name");
     await syncStoreReward(user.id);
     const reward = await first<{ id: number }>("SELECT id FROM loyalty_rewards WHERE owner_kind='STORE' AND owner_id=? AND status='ACTIVE' ORDER BY id LIMIT 1", user.id);
     const commission = moneyToUnits(await setting(urgent ? "commission_urgent" : "commission_normal"));
-    const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,kind,contact,order_value,is_paid,notes,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,delivery_price,agreed_price,price_source,commission,loyalty_reward_id)
-      VALUES(?,NULL,?,?,?,?,'NEW',?,'STORE',?,?,?,?,?,?,?, ?,NULL,NULL,NULL,?,?)`, user.id, String(body.pickup ?? store.address ?? "").slice(0, 200), String(body.dropoff).slice(0, 200), String(body.details ?? "").trim().slice(0, 500), urgent, now(), String(body.contact).slice(0, 120), orderValue, paid, String(body.notes ?? "").slice(0, 500), pickupLat, pickupLng, dropoffLat, dropoffLng, commission, reward?.id ?? null);
+    const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,kind,contact,order_value,is_paid,notes,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,pickup_name,dropoff_name,delivery_price,agreed_price,price_source,commission,loyalty_reward_id)
+      VALUES(?,NULL,?,?,?,?,'NEW',?,'STORE',?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?)`, user.id, String(body.pickup ?? store.address ?? "").slice(0, 200), String(body.dropoff).slice(0, 200), String(body.details ?? "").trim().slice(0, 500), urgent, now(), String(body.contact).slice(0, 120), orderValue, paid, String(body.notes ?? "").slice(0, 500), pickupLat, pickupLng, dropoffLat, dropoffLng, pickupName, dropoffName, commission, reward?.id ?? null);
     const orderId = inserted.lastRowId;
     if (orderId == null) throw new ApiError(500, "server error");
     const order = await first<Order>("SELECT * FROM orders WHERE id=?", orderId);
@@ -363,7 +421,7 @@ export async function handleOrderApi(ctx: ApiContext): Promise<unknown | typeof 
   if (method === "POST" && path === "/api/store/orders") return orderCreate(await apiUser(ctx, ["STORE"]), body);
   if (method === "GET" && path === "/api/store/orders") {
     const user = await apiUser(ctx, ["STORE"]);
-    return all("SELECT id,pickup,dropoff,details,urgent,status,order_value,is_paid,COALESCE(agreed_price,delivery_price) agreed_price,notes,contact,created,loyalty_reward_id FROM orders WHERE customer_id=? AND kind='STORE' ORDER BY id DESC", user.id);
+    return all("SELECT id,pickup,dropoff,pickup_name,dropoff_name,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,details,urgent,status,order_value,is_paid,COALESCE(agreed_price,delivery_price) agreed_price,notes,contact,created,loyalty_reward_id FROM orders WHERE customer_id=? AND kind='STORE' ORDER BY id DESC", user.id);
   }
   const storeCancelMatch = path.match(/^\/api\/store\/orders\/(\d+)\/cancel$/);
   if (method === "POST" && storeCancelMatch) {
@@ -392,6 +450,13 @@ export async function applyOrderStatus(order: Order, status: string, actorId: nu
   await setStatus(order, status, actorId);
 }
 
+export async function requireActiveOrderService(order: Pick<Order, "kind" | "service_id">): Promise<void> {
+  if (order.kind === "STORE" || order.service_id == null) return;
+  if (!(await first("SELECT 1 AS found FROM services WHERE id=? AND active=1", order.service_id))) {
+    throw new ApiError(409, "الخدمة غير متاحة حاليًا");
+  }
+}
+
 export async function driverOrderAccess(orderId: number, user: MobileUser): Promise<Order> {
   return getOrder(orderId, user);
 }
@@ -400,12 +465,25 @@ export async function proposePrice(orderId: number, driver: MobileUser, value: u
   const offer = await first<{ id: number; expires: number }>("SELECT id,expires FROM offers WHERE order_id=? AND driver_id=? AND status='PENDING' AND expires>=?", orderId, driver.id, now());
   if (!offer) throw new ApiError(409, "offer not available");
   const order = await orderById(orderId);
-  const driverData = await first<{ outstanding: number; blocked_until: number; available: number }>("SELECT outstanding,blocked_until,available FROM drivers WHERE user_id=?", driver.id);
+  const driverData = await first<{ outstanding: number; blocked_until: number; available: number; gender: string }>("SELECT outstanding,blocked_until,available,gender FROM drivers WHERE user_id=?", driver.id);
   const active = await first<{ count: number }>("SELECT COUNT(*) count FROM orders WHERE driver_id=? AND status NOT IN ('DELIVERED','CANCELLED')", driver.id);
   if (!order || order.status !== "SEARCHING_DRIVER" || order.driver_id != null || !driverData) throw new ApiError(409, "offer not available");
+  await requireActiveOrderService(order);
+  if (order.female_driver_only && driverData.gender !== "female") throw new ApiError(403, "هذا الطلب مخصص لسائقة مؤهلة");
+  const pendingPrivateOffer = await first("SELECT 1 AS found FROM offers p JOIN orders po ON po.id=p.order_id WHERE p.driver_id=? AND p.status='PENDING' AND po.private_ride=1 AND p.order_id<>? LIMIT 1", driver.id, orderId);
+  if (pendingPrivateOffer && !order.private_ride) throw new ApiError(409, "لديك عرض لمشوار خاص؛ أنهه قبل قبول طلب آخر");
   if (driverData.outstanding >= await setting("custody_cap") || driverData.blocked_until > now() || !driverData.available || Number(active?.count ?? 0) >= await setting("max_active_orders")) throw new ApiError(409, "not eligible");
   const price = roundedPrice(value);
-  const update = await run("UPDATE orders SET driver_id=?,agreed_price=NULL,delivery_price=NULL,price_source=NULL,proposed_price=?,price_status='PENDING_CUSTOMER',price_expires=? WHERE id=? AND driver_id IS NULL AND status='SEARCHING_DRIVER'", driver.id, price, now() + priceResponseTimeout, orderId);
+  const priceCap = order.customer_offer_price ?? order.max_price;
+  if (priceCap != null && moneyToUnits(price) > Number(priceCap)) throw new ApiError(400, "لا يمكن رفع السعر فوق السعر الذي اختاره الزبون");
+  const update = await run(`UPDATE orders SET driver_id=?,agreed_price=NULL,delivery_price=NULL,price_source=NULL,proposed_price=?,price_status='PENDING_CUSTOMER',price_expires=?
+    WHERE id=? AND driver_id IS NULL AND status='SEARCHING_DRIVER'
+      AND NOT EXISTS(SELECT 1 FROM orders x WHERE x.driver_id=? AND x.status NOT IN ('DELIVERED','CANCELLED') AND x.private_ride=1)
+      AND NOT EXISTS(SELECT 1 FROM offers pf JOIN orders po ON po.id=pf.order_id WHERE pf.driver_id=? AND pf.status='PENDING' AND po.private_ride=1 AND pf.order_id<>?)
+      AND (?=0 OR (
+        NOT EXISTS(SELECT 1 FROM orders x WHERE x.driver_id=? AND x.status NOT IN ('DELIVERED','CANCELLED') AND x.id<>?)
+        AND NOT EXISTS(SELECT 1 FROM offers p WHERE p.driver_id=? AND p.status='PENDING' AND p.order_id<>?)
+      ))`, driver.id, price, now() + priceResponseTimeout, orderId, driver.id, driver.id, orderId, order.private_ride ? 1 : 0, driver.id, orderId, driver.id, orderId);
   if (!update.changes) throw new ApiError(409, "offer not available");
   await run("UPDATE offers SET status='ACCEPTED' WHERE id=? AND status='PENDING'", offer.id);
   await run("UPDATE offers SET status='CLOSED' WHERE order_id=? AND status='PENDING'", orderId);
@@ -418,8 +496,9 @@ export async function proposePrice(orderId: number, driver: MobileUser, value: u
 
 export async function driverOrders(user: MobileUser): Promise<Record<string, unknown>[]> {
   const activeOnly = "o.status NOT IN ('DELIVERED','CANCELLED')";
-  return all(`SELECT o.id,o.customer_id,o.service_id,o.pickup,o.dropoff,o.details,o.urgent,o.status,o.driver_id,COALESCE(o.agreed_price,o.delivery_price) agreed_price,o.proposed_price,o.price_status,o.loyalty_reward_id,o.created,o.confirmed,o.kind,
-    o.order_value,o.is_paid,o.notes,o.pickup_lat,o.pickup_lng,o.dropoff_lat,o.dropoff_lng,
+  return all(`SELECT o.id,o.customer_id,o.service_id,o.pickup,o.dropoff,o.pickup_name,o.dropoff_name,o.details,o.urgent,o.status,o.driver_id,COALESCE(o.agreed_price,o.delivery_price) agreed_price,o.proposed_price,o.price_status,o.loyalty_reward_id,o.created,o.confirmed,o.kind,
+    o.order_value,o.is_paid,o.notes,o.pickup_lat,o.pickup_lng,o.dropoff_lat,o.dropoff_lng,o.route_distance_m/1000.0 route_distance_km,
+    o.max_price/1000.0 max_price,o.customer_offer_price/1000.0 customer_offer_price,o.female_driver_only,o.private_ride,
     CASE WHEN ${activeOnly} THEN c.name END customer_name,CASE WHEN ${activeOnly} THEN c.phone END customer_phone,
     CASE WHEN ${activeOnly} AND o.kind='STORE' THEN s.address END store_address,CASE WHEN ${activeOnly} THEN o.contact END contact
     FROM orders o JOIN "User" c ON c.id=o.customer_id LEFT JOIN stores s ON s.user_id=o.customer_id WHERE o.driver_id=? ORDER BY o.id DESC`, user.id);
@@ -428,7 +507,8 @@ export async function driverOrders(user: MobileUser): Promise<Record<string, unk
 export async function driverOfferList(userId: number): Promise<Record<string, unknown>[]> {
   const activeOrder = await first<{ id: number }>("SELECT id FROM orders WHERE driver_id=? AND status NOT IN ('DELIVERED','CANCELLED') ORDER BY id DESC LIMIT 1", userId);
   const driverActiveOrderId = activeOrder ? Number(activeOrder.id) : null;
-  const orders = await all<Record<string, unknown>>(`SELECT f.order_id,f.expires,f.distance_m,COALESCE(o.agreed_price,o.delivery_price) agreed_price,o.loyalty_reward_id,o.urgent,o.pickup,o.dropoff,o.details,o.kind,o.order_value,o.is_paid,o.notes,
+  const orders = await all<Record<string, unknown>>(`SELECT f.order_id,f.expires,f.distance_m,COALESCE(o.agreed_price,o.delivery_price) agreed_price,o.loyalty_reward_id,o.urgent,o.pickup,o.dropoff,o.pickup_name,o.dropoff_name,o.details,o.kind,o.order_value,o.is_paid,o.notes,
+    o.pickup_lat,o.pickup_lng,o.dropoff_lat,o.dropoff_lng,o.route_distance_m/1000.0 route_distance_km,o.max_price/1000.0 max_price,o.customer_offer_price/1000.0 customer_offer_price,o.female_driver_only,o.private_ride,
     CASE WHEN o.kind='STORE' THEN s.store_name END store_name,CASE WHEN o.kind='STORE' THEN s.address END store_address
     FROM offers f JOIN orders o ON o.id=f.order_id LEFT JOIN stores s ON s.user_id=o.customer_id
     WHERE f.driver_id=? AND f.status='PENDING' AND o.status='SEARCHING_DRIVER' AND o.driver_id IS NULL AND (? IS NULL OR o.id<>?)

@@ -75,6 +75,12 @@ export async function handleDriverApi(ctx: ApiContext): Promise<unknown | typeof
     const orderId = Number(offerMatch[1]);
     const offer = await first<{ id: number }>("SELECT id FROM offers WHERE order_id=? AND driver_id=? AND status='PENDING' AND expires>=?", orderId, user.id, now());
     if (!offer) throw new ApiError(409, "offer not available");
+    const eligibility = await first<{ female_driver_only: number }>("SELECT female_driver_only FROM orders WHERE id=? AND status='SEARCHING_DRIVER' AND driver_id IS NULL", orderId);
+    if (!eligibility) throw new ApiError(409, "offer not available");
+    if (eligibility.female_driver_only) {
+      const driver = await first<{ gender: string }>("SELECT gender FROM drivers WHERE user_id=?", user.id);
+      if (driver?.gender !== "female") throw new ApiError(403, "هذا الطلب مخصص لسائقة مؤهلة");
+    }
     if (offerMatch[2] === "reject") {
       const result = await run("UPDATE offers SET status='REJECTED' WHERE id=? AND status='PENDING'", offer.id);
       if (!result.changes) throw new ApiError(409, "offer not available");

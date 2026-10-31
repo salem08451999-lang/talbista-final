@@ -3,7 +3,7 @@ import { ApiError, all, asNumber, asString, batch, first, now, normalizePhone, r
 import { ApiContext, apiUser, NO_ROUTE } from "./accounts";
 import { balance, ledgerRows, moneyToUnits, postLedger, settleCustody, unitsToMoney } from "./ledger";
 import { adminLoyaltyView, loyaltyConfig } from "./loyalty";
-import { dispatchNewOrders, orderById, applyOrderStatus } from "./orders";
+import { dispatchNewOrders, orderById, applyOrderStatus, requireActiveOrderService } from "./orders";
 import { notifyUser } from "./notifications";
 
 async function admin(ctx: ApiContext): Promise<MobileUser> { return apiUser(ctx, ["ADMIN"]); }
@@ -106,16 +106,16 @@ export async function handleAdminApi(ctx: ApiContext): Promise<unknown | typeof 
   if (!path.startsWith("/api/admin/")) return NO_ROUTE;
   const user = await admin(ctx);
 
-  if (method === "GET" && path === "/api/admin/driver-applications") return all("SELECT id,name,phone,car,model,year,color,plate,status,submitted_at FROM driver_applications WHERE status='PENDING' ORDER BY submitted_at,id");
+  if (method === "GET" && path === "/api/admin/driver-applications") return all("SELECT id,name,phone,car,model,year,color,plate,gender,status,submitted_at FROM driver_applications WHERE status='PENDING' ORDER BY submitted_at,id");
   const applicationMatch = path.match(/^\/api\/admin\/driver-applications\/(\d+)(?:\/(approve|reject))?$/);
   if (applicationMatch && method === "GET" && !applicationMatch[2]) {
-    const row = await first("SELECT id,name,phone,car,model,year,color,plate,id_document,license_document,status,submitted_at FROM driver_applications WHERE id=? AND status='PENDING'", Number(applicationMatch[1]));
+    const row = await first("SELECT id,name,phone,car,model,year,color,plate,gender,id_document,license_document,status,submitted_at FROM driver_applications WHERE id=? AND status='PENDING'", Number(applicationMatch[1]));
     if (!row) throw new ApiError(404, "not found");
     return row;
   }
   if (applicationMatch && method === "POST" && applicationMatch[2]) {
     const id = Number(applicationMatch[1]);
-    const application = await first<{ id: number; name: string; phone: string; password_hash: string; car: string; model: string; year: number; color: string; plate: string }>("SELECT * FROM driver_applications WHERE id=? AND status='PENDING'", id);
+    const application = await first<{ id: number; name: string; phone: string; password_hash: string; car: string; model: string; year: number; color: string; plate: string; gender: string }>("SELECT * FROM driver_applications WHERE id=? AND status='PENDING'", id);
     if (!application) throw new ApiError(409, "application not pending");
     if (applicationMatch[2] === "reject") {
       await run("UPDATE driver_applications SET status='REJECTED',password_hash=NULL,id_document=NULL,license_document=NULL,decision_by=?,decided_at=?,decision_note=? WHERE id=? AND status='PENDING'", user.id, now(), String(body.note ?? "").trim().slice(0, 300), id);
@@ -127,7 +127,7 @@ export async function handleAdminApi(ctx: ApiContext): Promise<unknown | typeof 
     try {
       await batch([
         statement('INSERT INTO "User"(role,name,phone,password) VALUES(\'DRIVER\',?,?,?)', application.name, application.phone, application.password_hash),
-        statement("INSERT INTO drivers(user_id,car,model,year,color,plate,docs) SELECT id,?,?,?,?,?,? FROM \"User\" WHERE phone=?", application.car, application.model, application.year, application.color, application.plate, JSON.stringify({ application_id: id, documents_reviewed: true }), application.phone),
+        statement("INSERT INTO drivers(user_id,car,model,year,color,plate,gender,docs) SELECT id,?,?,?,?,?,?,? FROM \"User\" WHERE phone=?", application.car, application.model, application.year, application.color, application.plate, application.gender || "unknown", JSON.stringify({ application_id: id, documents_reviewed: true }), application.phone),
         statement("UPDATE driver_applications SET status='APPROVED',password_hash=NULL,id_document=NULL,license_document=NULL,decision_by=?,decided_at=?,approved_user_id=(SELECT id FROM \"User\" WHERE phone=?) WHERE id=? AND status='PENDING'", user.id, now(), application.phone, id),
       ]);
     } catch (error) { if (isUnique(error)) throw new ApiError(409, "phone exists"); throw error; }
@@ -144,11 +144,13 @@ export async function handleAdminApi(ctx: ApiContext): Promise<unknown | typeof 
     const phone = normalizePhone(body.phone);
     const password = validatePassword(body.password);
     const car = asString(body.car, "car", 120), model = asString(body.model, "model", 120), color = asString(body.color, "color", 120), plate = asString(body.plate, "plate", 120);
+    const gender = body.gender === undefined ? "unknown" : asString(body.gender, "gender", 16);
+    if (!["unknown", "female", "male"].includes(gender)) throw new ApiError(400, "invalid gender");
     const year = asNumber(body.year, "year", 1950, new Date().getFullYear() + 1);
     try {
       await batch([
         statement('INSERT INTO "User"(role,name,phone,password,photo) VALUES(\'DRIVER\',?,?,?,NULL)', name, phone, await hashPassword(password)),
-        statement("INSERT INTO drivers(user_id,car,model,year,color,plate,docs) SELECT id,?,?,?,?,?,? FROM \"User\" WHERE phone=?", car, model, year, color, plate, body.docs == null ? null : JSON.stringify(body.docs), phone),
+        statement("INSERT INTO drivers(user_id,car,model,year,color,plate,gender,docs) SELECT id,?,?,?,?,?,?,? FROM \"User\" WHERE phone=?", car, model, year, color, plate, gender, body.docs == null ? null : JSON.stringify(body.docs), phone),
       ]);
     } catch (error) { if (isUnique(error)) throw new ApiError(409, "phone exists"); throw error; }
     const created = await first<{ id: number }>('SELECT id FROM "User" WHERE phone=?', phone);
@@ -240,7 +242,21 @@ export async function handleAdminApi(ctx: ApiContext): Promise<unknown | typeof 
     if (body.driver_id == null) throw new ApiError(400, "missing driver_id");
     const driverId = asNumber(body.driver_id, "driver_id", 1);
     if (!order || ["ORDER_PICKED_UP", "ON_THE_WAY_TO_CUSTOMER", "DRIVER_ARRIVED_DESTINATION", "DELIVERED", "CANCELLED"].includes(order.status)) throw new ApiError(409, "cannot assign");
+    await requireActiveOrderService(order);
     if (!(await first('SELECT 1 AS found FROM "User" WHERE id=? AND role=\'DRIVER\' AND active=1', driverId))) throw new ApiError(400, "bad driver");
+    if (order.female_driver_only) {
+      const eligible = await first<{ gender: string }>("SELECT gender FROM drivers WHERE user_id=?", driverId);
+      if (eligible?.gender !== "female") throw new ApiError(403, "هذا الطلب مخصص لسائقة مؤهلة");
+    }
+    const activePrivate = await first("SELECT 1 AS found FROM orders WHERE driver_id=? AND private_ride=1 AND status NOT IN ('DELIVERED','CANCELLED') AND id<>? LIMIT 1", driverId, order.id);
+    if (activePrivate) throw new ApiError(409, "السائق مرتبط حاليًا بمشوار خاص حصري");
+    const pendingPrivate = await first("SELECT 1 AS found FROM offers p JOIN orders o ON o.id=p.order_id WHERE p.driver_id=? AND p.status='PENDING' AND o.private_ride=1 AND p.order_id<>? LIMIT 1", driverId, order.id);
+    if (pendingPrivate && !order.private_ride) throw new ApiError(409, "لدى السائق عرض لمشوار خاص لم يُحسم بعد");
+    if (order.private_ride) {
+      const otherActive = await first("SELECT 1 AS found FROM orders WHERE driver_id=? AND status NOT IN ('DELIVERED','CANCELLED') AND id<>? LIMIT 1", driverId, order.id);
+      const otherOffers = await first("SELECT 1 AS found FROM offers WHERE driver_id=? AND status='PENDING' AND order_id<>? LIMIT 1", driverId, order.id);
+      if (otherActive || otherOffers) throw new ApiError(409, "المشوار الخاص يحتاج سائقًا غير مرتبط بطلب أو عرض آخر");
+    }
     if (order.price_status !== "AGREED" || order.driver_id !== driverId) throw new ApiError(409, "price approval required");
     if (order.driver_id) await notifyUser(order.driver_id, `تم إلغاء الطلب #${order.id}`, { orderId: order.id });
     await run("UPDATE offers SET status='CANCELLED' WHERE order_id=? AND status='PENDING'", order.id);

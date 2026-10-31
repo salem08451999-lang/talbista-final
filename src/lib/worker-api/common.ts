@@ -15,6 +15,7 @@ export type MobileUser = {
 
 export type WorkerBindings = {
   DB?: D1Database;
+  ORS_API_KEY?: string;
   AUTH_TOKEN_SECRET?: string;
   FCM_SERVICE_ACCOUNT_JSON?: string;
   FCM_PROJECT_ID?: string;
