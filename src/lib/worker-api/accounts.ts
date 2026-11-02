@@ -108,7 +108,7 @@ export async function handleAccountApi(ctx: ApiContext): Promise<unknown | typeo
   }
 
   if (method === "POST" && path === "/api/driver-applications") {
-    requireFields(body, "name", "phone", "password", "car", "model", "year", "color", "plate", "id_document", "license_document");
+    requireFields(body, "name", "phone", "password", "car", "model", "year", "color", "plate", "gender", "id_document", "license_document");
     const name = asString(body.name, "name", 120);
     const car = asString(body.car, "car", 120);
     const model = asString(body.model, "model", 120);
@@ -116,8 +116,8 @@ export async function handleAccountApi(ctx: ApiContext): Promise<unknown | typeo
     const plate = asString(body.plate, "plate", 120);
     if ([name, car, model, color, plate].some((value) => value.length < 2)) throw new ApiError(400, "invalid data");
     const { phone, password } = phonePassword(body);
-    const gender = body.gender === undefined ? "unknown" : asString(body.gender, "gender", 16);
-    if (!["unknown", "female", "male"].includes(gender)) throw new ApiError(400, "invalid gender");
+    const gender = asString(body.gender, "gender", 16);
+    if (!["female", "male"].includes(gender)) throw new ApiError(400, "invalid gender");
     const year = Number(body.year);
     const currentYear = Number(new Intl.DateTimeFormat("en", { timeZone: "Africa/Tripoli", year: "numeric" }).format(new Date()));
     if (!Number.isInteger(year) || year < 1950 || year > currentYear + 1) throw new ApiError(400, "invalid data");

@@ -139,13 +139,13 @@ export async function handleAdminApi(ctx: ApiContext): Promise<unknown | typeof 
   }
 
   if (method === "POST" && path === "/api/admin/drivers") {
-    for (const key of ["name", "phone", "password", "car", "model", "year", "color", "plate"]) if (body[key] == null) throw new ApiError(400, `missing ${key}`);
+    for (const key of ["name", "phone", "password", "car", "model", "year", "color", "plate", "gender"]) if (body[key] == null) throw new ApiError(400, `missing ${key}`);
     const name = asString(body.name, "name", 120);
     const phone = normalizePhone(body.phone);
     const password = validatePassword(body.password);
     const car = asString(body.car, "car", 120), model = asString(body.model, "model", 120), color = asString(body.color, "color", 120), plate = asString(body.plate, "plate", 120);
-    const gender = body.gender === undefined ? "unknown" : asString(body.gender, "gender", 16);
-    if (!["unknown", "female", "male"].includes(gender)) throw new ApiError(400, "invalid gender");
+    const gender = asString(body.gender, "gender", 16);
+    if (!["female", "male"].includes(gender)) throw new ApiError(400, "invalid gender");
     const year = asNumber(body.year, "year", 1950, new Date().getFullYear() + 1);
     try {
       await batch([
@@ -172,6 +172,11 @@ export async function handleAdminApi(ctx: ApiContext): Promise<unknown | typeof 
       if (body[key] === undefined) continue;
       const value = key === "year" ? asNumber(body[key], key, 1950, new Date().getFullYear() + 1) : asString(body[key], key, 120);
       await run(`UPDATE drivers SET ${key}=? WHERE user_id=?`, value, driverId);
+    }
+    if (body.gender !== undefined) {
+      const gender = asString(body.gender, "gender", 16);
+      if (!["male", "female", "unknown"].includes(gender)) throw new ApiError(400, "invalid gender");
+      await run("UPDATE drivers SET gender=? WHERE user_id=?", gender, driverId);
     }
     await audit(user.id, "patch_driver", { id: driverId, fields: Object.keys(body) });
     return { ok: 1 };
@@ -244,9 +249,12 @@ export async function handleAdminApi(ctx: ApiContext): Promise<unknown | typeof 
     if (!order || ["ORDER_PICKED_UP", "ON_THE_WAY_TO_CUSTOMER", "DRIVER_ARRIVED_DESTINATION", "DELIVERED", "CANCELLED"].includes(order.status)) throw new ApiError(409, "cannot assign");
     await requireActiveOrderService(order);
     if (!(await first('SELECT 1 AS found FROM "User" WHERE id=? AND role=\'DRIVER\' AND active=1', driverId))) throw new ApiError(400, "bad driver");
-    if (order.female_driver_only) {
+    const requiredGender = order.private_ride && order.requested_gender
+      ? order.requested_gender
+      : order.female_driver_only ? "female" : null;
+    if (requiredGender) {
       const eligible = await first<{ gender: string }>("SELECT gender FROM drivers WHERE user_id=?", driverId);
-      if (eligible?.gender !== "female") throw new ApiError(403, "هذا الطلب مخصص لسائقة مؤهلة");
+      if (eligible?.gender !== requiredGender) throw new ApiError(403, requiredGender === "female" ? "هذا الطلب مخصص للسائقات فقط" : "هذا الطلب مخصص للسائقين فقط");
     }
     const activePrivate = await first("SELECT 1 AS found FROM orders WHERE driver_id=? AND private_ride=1 AND status NOT IN ('DELIVERED','CANCELLED') AND id<>? LIMIT 1", driverId, order.id);
     if (activePrivate) throw new ApiError(409, "السائق مرتبط حاليًا بمشوار خاص حصري");

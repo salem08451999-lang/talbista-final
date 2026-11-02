@@ -75,16 +75,19 @@ export async function handleDriverApi(ctx: ApiContext): Promise<unknown | typeof
     const orderId = Number(offerMatch[1]);
     const offer = await first<{ id: number }>("SELECT id FROM offers WHERE order_id=? AND driver_id=? AND status='PENDING' AND expires>=?", orderId, user.id, now());
     if (!offer) throw new ApiError(409, "offer not available");
-    const eligibility = await first<{ female_driver_only: number }>("SELECT female_driver_only FROM orders WHERE id=? AND status='SEARCHING_DRIVER' AND driver_id IS NULL", orderId);
+    const eligibility = await first<{ female_driver_only: number; private_ride: number; requested_gender: string | null }>("SELECT female_driver_only,private_ride,requested_gender FROM orders WHERE id=? AND status='SEARCHING_DRIVER' AND driver_id IS NULL", orderId);
     if (!eligibility) throw new ApiError(409, "offer not available");
-    if (eligibility.female_driver_only) {
-      const driver = await first<{ gender: string }>("SELECT gender FROM drivers WHERE user_id=?", user.id);
-      if (driver?.gender !== "female") throw new ApiError(403, "هذا الطلب مخصص لسائقة مؤهلة");
-    }
     if (offerMatch[2] === "reject") {
       const result = await run("UPDATE offers SET status='REJECTED' WHERE id=? AND status='PENDING'", offer.id);
       if (!result.changes) throw new ApiError(409, "offer not available");
       return { ok: 1 };
+    }
+    const requestedGender = eligibility.private_ride && eligibility.requested_gender
+      ? eligibility.requested_gender
+      : eligibility.female_driver_only ? "female" : null;
+    if (requestedGender) {
+      const driver = await first<{ gender: string }>("SELECT gender FROM drivers WHERE user_id=?", user.id);
+      if (driver?.gender !== requestedGender) throw new ApiError(403, requestedGender === "female" ? "هذا الطلب مخصص للسائقات فقط" : "هذا الطلب مخصص للسائقين فقط");
     }
     if (body.agreed_price === undefined || body.agreed_price === null || body.agreed_price === "") throw new ApiError(400, "price required");
     return proposePrice(orderId, user, body.agreed_price);

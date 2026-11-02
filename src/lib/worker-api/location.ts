@@ -5,6 +5,12 @@ import { priceFromRoadDistance, type RouteQuote } from "./location-pricing";
 const BENGHAZI_BIAS = { lat: 32.116, lon: 20.068 };
 const PHOTON = "https://photon.komoot.io";
 const ORS = "https://api.heigit.org/v2/directions/driving-car/json";
+const GEOCODE_CACHE_TTL = 24 * 60 * 60;
+const PHOTON_HEADERS = {
+  Accept: "application/json",
+  "User-Agent": "TalbistaApp/1.0 (contact@talbista.pages.dev)",
+  Referer: "https://talbista.pages.dev",
+};
 
 type Coordinates = { pickup_lat: number; pickup_lng: number; dropoff_lat: number; dropoff_lng: number };
 function bool(value: unknown): boolean {
@@ -30,7 +36,7 @@ function labelOf(properties: Record<string, unknown>): string {
 }
 
 async function photon(url: URL): Promise<Record<string, unknown>> {
-  const response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(7000) });
+  const response = await fetch(url, { headers: PHOTON_HEADERS, signal: AbortSignal.timeout(7000) });
   if (!response.ok) throw new ApiError(502, "خدمة اقتراح المواقع غير متاحة مؤقتًا");
   return await response.json() as Record<string, unknown>;
 }
@@ -40,26 +46,42 @@ async function suggestions(ctx: ApiContext): Promise<unknown> {
   const url = new URL(ctx.request.url);
   const q = (url.searchParams.get("q") ?? "").trim();
   if (q.length < 2 || q.length > 120) throw new ApiError(400, "أدخل اسم منطقة أو شارعًا صحيحًا");
+  const cacheKey = `suggest:${q.normalize("NFKC").toLocaleLowerCase("ar-LY").replace(/\s+/g, " ")}`;
+  const timestamp = now();
+  let cached: { result: string; created_at: number } | null = null;
+  try { cached = await first<{ result: string; created_at: number }>("SELECT result,created_at FROM geocode_cache WHERE query=?", cacheKey); }
+  catch { /* Geocoding stays available during a migration rollout; cache writes resume once D1 has the table. */ }
+  if (cached && timestamp - Number(cached.created_at) < GEOCODE_CACHE_TTL) {
+    try { return JSON.parse(cached.result) as unknown; } catch { /* Replace invalid cache below. */ }
+  }
   const endpoint = new URL("/api/", PHOTON);
   endpoint.searchParams.set("q", q);
   endpoint.searchParams.set("lat", String(BENGHAZI_BIAS.lat));
   endpoint.searchParams.set("lon", String(BENGHAZI_BIAS.lon));
   endpoint.searchParams.set("limit", "6");
-  endpoint.searchParams.set("lang", "ar");
-  const data = await photon(endpoint);
-  const source = Array.isArray(data.features) ? data.features : [];
-  const features = source.slice(0, 6).flatMap((value) => {
-    if (!value || typeof value !== "object") return [];
-    const feature = value as Record<string, unknown>;
-    const geometry = feature.geometry as { type?: unknown; coordinates?: unknown } | undefined;
-    const properties = feature.properties as Record<string, unknown> | undefined;
-    const coords = geometry?.coordinates;
-    if (!Array.isArray(coords) || coords.length < 2 || !properties) return [];
-    const lng = Number(coords[0]), lat = Number(coords[1]);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) return [];
-    return [{ geometry: { type: "Point", coordinates: [lng, lat] }, properties: { name: labelOf(properties), label: labelOf(properties), city: properties.city ?? null, country: properties.country ?? null } }];
-  });
-  return { features };
+  try {
+    const data = await photon(endpoint);
+    const source = Array.isArray(data.features) ? data.features : [];
+    const features = source.slice(0, 6).flatMap((value) => {
+      if (!value || typeof value !== "object") return [];
+      const feature = value as Record<string, unknown>;
+      const geometry = feature.geometry as { type?: unknown; coordinates?: unknown } | undefined;
+      const properties = feature.properties as Record<string, unknown> | undefined;
+      const coords = geometry?.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2 || !properties) return [];
+      const lng = Number(coords[0]), lat = Number(coords[1]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) return [];
+      const label = labelOf(properties);
+      return [{ geometry: { type: "Point", coordinates: [lng, lat] }, properties: { name: label, label, city: properties.city ?? null, country: properties.country ?? null } }];
+    });
+    const result = { features, message: features.length ? "" : "لم نعثر على اقتراحات؛ حدد النقطة مباشرة على الخريطة." };
+    await run(`INSERT INTO geocode_cache(query,result,created_at) VALUES(?,?,?)
+      ON CONFLICT(query) DO UPDATE SET result=excluded.result,created_at=excluded.created_at`, cacheKey, JSON.stringify(result), timestamp).catch(() => undefined);
+    return result;
+  } catch {
+    console.warn("[GEOCODE] Photon request failed; returning empty suggestions");
+    return { features: [], message: "تعذر جلب الاقتراحات الآن. يمكنك تحديد النقطة مباشرة على الخريطة." };
+  }
 }
 
 async function reverse(ctx: ApiContext): Promise<unknown> {
@@ -72,8 +94,9 @@ async function reverse(ctx: ApiContext): Promise<unknown> {
   endpoint.searchParams.set("lat", String(lat));
   endpoint.searchParams.set("lon", String(lon));
   endpoint.searchParams.set("limit", "1");
-  endpoint.searchParams.set("lang", "ar");
-  const data = await photon(endpoint);
+  let data: Record<string, unknown>;
+  try { data = await photon(endpoint); }
+  catch { return { features: [], message: "تعذر جلب اسم الموقع الآن؛ تم حفظ الإحداثيات." }; }
   const feature = Array.isArray(data.features) ? data.features[0] as Record<string, unknown> | undefined : undefined;
   const properties = feature?.properties as Record<string, unknown> | undefined;
   const name = properties ? labelOf(properties) : "موقع على الخريطة";
@@ -119,8 +142,10 @@ async function estimate(ctx: ApiContext): Promise<unknown> {
   const user = await apiUser(ctx, ["CUSTOMER"]);
   await consumeEstimateQuota(user.id);
   const coords = locationCoordinates(ctx.body);
-  const femaleDriver = bool(ctx.body.female_driver_only);
-  return { ok: true, provider: "openrouteservice", ...await calculateRouteQuote(coords, femaleDriver) };
+  const requestedGender = ctx.body.requested_gender == null ? null : String(ctx.body.requested_gender);
+  if (requestedGender !== null && requestedGender !== "male" && requestedGender !== "female") throw new ApiError(400, "invalid requested_gender");
+  const femaleDriver = requestedGender === "female" || bool(ctx.body.female_driver_only);
+  return { ok: true, provider: "openrouteservice", requested_gender: requestedGender, ...await calculateRouteQuote(coords, femaleDriver) };
 }
 
 export async function handleLocationApi(ctx: ApiContext): Promise<unknown | typeof NO_ROUTE> {
@@ -128,7 +153,7 @@ export async function handleLocationApi(ctx: ApiContext): Promise<unknown | type
   if (method === "GET" && path === "/api/location/status") {
     return { provider: "openrouteservice", routing_ready: routeProviderReady() };
   }
-  if (method === "GET" && path === "/api/location/suggest") return suggestions(ctx);
+  if (method === "GET" && (path === "/api/location/suggest" || path === "/api/suggest")) return suggestions(ctx);
   if (method === "GET" && path === "/api/location/reverse") return reverse(ctx);
   if (method === "POST" && path === "/api/location/estimate") return estimate(ctx);
   return NO_ROUTE;

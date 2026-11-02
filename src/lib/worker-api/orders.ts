@@ -31,6 +31,7 @@ type Order = {
   pickup_lat: number | null; pickup_lng: number | null; dropoff_lat: number | null; dropoff_lng: number | null;
   pickup_name: string | null; dropoff_name: string | null; route_distance_m: number | null;
   max_price: number | null; customer_offer_price: number | null; female_driver_only: number; private_ride: number;
+  requested_gender: "male" | "female" | null; final_price: number | null;
   price_source: string | null; commission: number | null; loyalty_reward_id: number | null; is_demo: number | null;
   price_expires: number | null;
 };
@@ -61,13 +62,13 @@ function formatDistance(meters: number): string {
   return meters >= 1000 ? `${(meters / 1000).toFixed(1)} كم` : `${Math.round(meters / 10) * 10} متر`;
 }
 
-async function eligibleDrivers(orderId: number, timestamp: number, femaleOnly = false, privateRide = false) {
+async function eligibleDrivers(orderId: number, timestamp: number, requiredGender: "male" | "female" | null = null, privateRide = false) {
   const cap = await setting("custody_cap");
   const maxActive = await setting("max_active_orders");
   return all<{ id: number; lat: number | null; lng: number | null; loc_at: number; last_offer: number }>(
     `SELECT u.id,d.lat,d.lng,d.loc_at,d.last_offer FROM "User" u JOIN drivers d ON d.user_id=u.id
      WHERE u.active=1 AND u.role='DRIVER' AND d.available=1 AND d.outstanding<? AND d.blocked_until<=?
-       AND (?=0 OR d.gender='female')
+       AND (? IS NULL OR d.gender=?)
        AND (SELECT COUNT(*) FROM orders x WHERE x.driver_id=u.id AND x.status NOT IN ('DELIVERED','CANCELLED'))
          +(SELECT COUNT(*) FROM offers p WHERE p.driver_id=u.id AND p.status='PENDING') < ?
        AND NOT EXISTS(SELECT 1 FROM orders x WHERE x.driver_id=u.id AND x.status NOT IN ('DELIVERED','CANCELLED') AND x.private_ride=1)
@@ -77,12 +78,13 @@ async function eligibleDrivers(orderId: number, timestamp: number, femaleOnly = 
          AND NOT EXISTS(SELECT 1 FROM offers p WHERE p.driver_id=u.id AND p.status='PENDING')
        ))
        AND NOT EXISTS(SELECT 1 FROM offers f WHERE f.driver_id=u.id AND f.order_id=? AND f.status='PENDING')`,
-    cap, timestamp, femaleOnly ? 1 : 0, maxActive, privateRide ? 1 : 0, orderId,
+    cap, timestamp, requiredGender, requiredGender, maxActive, privateRide ? 1 : 0, orderId,
   );
 }
 
-async function selectDriver(order: Pick<Order, "id" | "pickup_lat" | "pickup_lng" | "female_driver_only" | "private_ride">, timestamp: number): Promise<{ id: number; distance: number | null } | null> {
-  const drivers = await eligibleDrivers(order.id, timestamp, Boolean(order.female_driver_only), Boolean(order.private_ride));
+async function selectDriver(order: Pick<Order, "id" | "pickup_lat" | "pickup_lng" | "female_driver_only" | "private_ride" | "requested_gender">, timestamp: number): Promise<{ id: number; distance: number | null } | null> {
+  const requiredGender = order.private_ride && order.requested_gender ? order.requested_gender : order.female_driver_only ? "female" : null;
+  const drivers = await eligibleDrivers(order.id, timestamp, requiredGender, Boolean(order.private_ride));
   if (order.pickup_lat != null && order.pickup_lng != null) {
     const freshAge = await setting("location_max_age");
     const fresh = drivers.filter((driver) => driver.lat != null && driver.lng != null && Number(driver.loc_at) >= timestamp - freshAge);
@@ -171,6 +173,7 @@ export async function orderView(order: Order, viewer?: MobileUser): Promise<Reco
   const result: Record<string, unknown> = { ...order, agreed_price: order.agreed_price ?? order.delivery_price };
   result.max_price = order.max_price == null ? null : unitsToMoney(Number(order.max_price));
   result.customer_offer_price = order.customer_offer_price == null ? null : unitsToMoney(Number(order.customer_offer_price));
+  result.final_price = order.final_price == null ? null : unitsToMoney(Number(order.final_price));
   result.route_distance_km = order.route_distance_m == null ? null : Math.round(Number(order.route_distance_m) / 10) / 100;
   delete result.delivery_fee;
   delete result.delivery_price;
@@ -238,16 +241,21 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     const autoPricing = strictFlag(body, "auto_pricing");
     const femaleOnly = strictFlag(body, "female_driver_only");
     const privateRide = strictFlag(body, "private_ride");
+    const requestedGender = body.requested_gender == null ? null : String(body.requested_gender);
+    if (privateRide && requestedGender !== "male" && requestedGender !== "female") throw new ApiError(400, "اختر جنس السائق للمشوار الخاص");
+    if (!privateRide && requestedGender != null) throw new ApiError(400, "requested_gender is only valid for private rides");
+    if (femaleOnly && privateRide) throw new ApiError(400, "اختر سائقة المشوار الخاص من خيارات الجنس");
     let routeDistanceM: number | null = null;
     let maxPriceUnits: number | null = null;
     let customerOfferUnits: number | null = null;
     // Once routing is configured, every customer order must be priced from the
     // server-side road distance; the browser flag is never an authorization bypass.
     const routingReady = routeProviderReady();
-    if (shouldRecalculateRouteQuote(user.role, routingReady, autoPricing, femaleOnly)) {
+    if (shouldRecalculateRouteQuote(user.role, routingReady, autoPricing, femaleOnly || privateRide)) {
       if (pickupLat == null || pickupLng == null || dropoffLat == null || dropoffLng == null) throw new ApiError(400, "اختر موقعي الاستلام والتسليم قبل حساب السعر");
       await consumeEstimateQuota(user.id);
-      const quote = await calculateRouteQuote({ pickup_lat: pickupLat, pickup_lng: pickupLng, dropoff_lat: dropoffLat, dropoff_lng: dropoffLng }, femaleOnly);
+      const femalePriceApplies = requestedGender === "female" || femaleOnly;
+      const quote = await calculateRouteQuote({ pickup_lat: pickupLat, pickup_lng: pickupLng, dropoff_lat: dropoffLat, dropoff_lng: dropoffLng }, femalePriceApplies);
       const minUnits = moneyToUnits(quote.min_price);
       maxPriceUnits = moneyToUnits(quote.max_price);
       const requestedOffer = body.customer_offer_price == null ? quote.max_price : asNumber(body.customer_offer_price, "customer_offer_price", quote.min_price, quote.max_price);
@@ -265,8 +273,8 @@ async function orderCreate(user: MobileUser, body: Record<string, unknown>) {
     const commission = moneyToUnits(await setting(urgent ? "commission_urgent" : "commission_normal"));
     let orderId: number | null = null;
     try {
-      const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,pickup_name,dropoff_name,route_distance_m,max_price,customer_offer_price,female_driver_only,private_ride,delivery_price,agreed_price,price_source,commission,idempotency_key,delivery_code)
-        VALUES(?,?,?,?,?,?, 'NEW', ?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?)`, user.id, serviceId, String(body.pickup).slice(0, 200), String(body.dropoff).slice(0, 200), details, urgent, createdAt, pickupLat, pickupLng, dropoffLat, dropoffLng, pickupName, dropoffName, routeDistanceM, maxPriceUnits, customerOfferUnits, femaleOnly ? 1 : 0, privateRide ? 1 : 0, commission, idempotencyKey, await randomDeliveryCode());
+      const inserted = await run(`INSERT INTO orders(customer_id,service_id,pickup,dropoff,details,urgent,status,created,pickup_lat,pickup_lng,dropoff_lat,dropoff_lng,pickup_name,dropoff_name,route_distance_m,max_price,customer_offer_price,female_driver_only,private_ride,requested_gender,final_price,delivery_price,agreed_price,price_source,commission,idempotency_key,delivery_code)
+        VALUES(?,?,?,?,?,?,'NEW',?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?)`, user.id, serviceId, String(body.pickup).slice(0, 200), String(body.dropoff).slice(0, 200), details, urgent, createdAt, pickupLat, pickupLng, dropoffLat, dropoffLng, pickupName, dropoffName, routeDistanceM, maxPriceUnits, customerOfferUnits, femaleOnly ? 1 : 0, privateRide ? 1 : 0, requestedGender, customerOfferUnits, commission, idempotencyKey, await randomDeliveryCode());
       orderId = inserted.lastRowId == null ? null : Number(inserted.lastRowId);
     } catch (error) {
       const racedOrder = await findIdempotentOrder(idempotencyKey, user.id);
@@ -358,7 +366,7 @@ export async function handleOrderApi(ctx: ApiContext): Promise<unknown | typeof 
     if (body.accept) {
       const updated = await run("UPDATE orders SET price_status='AGREED',price_expires=NULL WHERE id=? AND status='PRICE_PENDING' AND price_status='PENDING_CUSTOMER' AND price_expires>?", order.id, now());
       if (!updated.changes) throw new ApiError(409, "price response expired");
-      await run("UPDATE orders SET delivery_price=?,agreed_price=?,price_source='CUSTOMER_ACCEPTED' WHERE id=?", proposed, proposed, order.id);
+      await run("UPDATE orders SET delivery_price=?,agreed_price=?,final_price=?,price_source='CUSTOMER_ACCEPTED' WHERE id=?", proposed, proposed, proposed, order.id);
       await run("INSERT INTO order_price_history(order_id,price,at,actor_id,reason) VALUES(?,?,?,?,?)", order.id, proposed, now(), user.id, "وافق طالب الخدمة على عرض السائق");
       await setStatus(order, "DRIVER_ASSIGNED", user.id);
       await notifyUser(order.driver_id, `وافق طالب الخدمة على سعر التوصيل ${proposed} د.ل للطلب #${order.id}. يمكنك البدء.`, { orderId: order.id, kind: "price", soundEvent: "accepted" });
@@ -469,7 +477,8 @@ export async function proposePrice(orderId: number, driver: MobileUser, value: u
   const active = await first<{ count: number }>("SELECT COUNT(*) count FROM orders WHERE driver_id=? AND status NOT IN ('DELIVERED','CANCELLED')", driver.id);
   if (!order || order.status !== "SEARCHING_DRIVER" || order.driver_id != null || !driverData) throw new ApiError(409, "offer not available");
   await requireActiveOrderService(order);
-  if (order.female_driver_only && driverData.gender !== "female") throw new ApiError(403, "هذا الطلب مخصص لسائقة مؤهلة");
+  const requiredGender = order.private_ride && order.requested_gender ? order.requested_gender : order.female_driver_only ? "female" : null;
+  if (requiredGender && driverData.gender !== requiredGender) throw new ApiError(403, requiredGender === "female" ? "هذا الطلب مخصص للسائقات فقط" : "هذا الطلب مخصص للسائقين فقط");
   const pendingPrivateOffer = await first("SELECT 1 AS found FROM offers p JOIN orders po ON po.id=p.order_id WHERE p.driver_id=? AND p.status='PENDING' AND po.private_ride=1 AND p.order_id<>? LIMIT 1", driver.id, orderId);
   if (pendingPrivateOffer && !order.private_ride) throw new ApiError(409, "لديك عرض لمشوار خاص؛ أنهه قبل قبول طلب آخر");
   if (driverData.outstanding >= await setting("custody_cap") || driverData.blocked_until > now() || !driverData.available || Number(active?.count ?? 0) >= await setting("max_active_orders")) throw new ApiError(409, "not eligible");
@@ -498,7 +507,7 @@ export async function driverOrders(user: MobileUser): Promise<Record<string, unk
   const activeOnly = "o.status NOT IN ('DELIVERED','CANCELLED')";
   return all(`SELECT o.id,o.customer_id,o.service_id,o.pickup,o.dropoff,o.pickup_name,o.dropoff_name,o.details,o.urgent,o.status,o.driver_id,COALESCE(o.agreed_price,o.delivery_price) agreed_price,o.proposed_price,o.price_status,o.loyalty_reward_id,o.created,o.confirmed,o.kind,
     o.order_value,o.is_paid,o.notes,o.pickup_lat,o.pickup_lng,o.dropoff_lat,o.dropoff_lng,o.route_distance_m/1000.0 route_distance_km,
-    o.max_price/1000.0 max_price,o.customer_offer_price/1000.0 customer_offer_price,o.female_driver_only,o.private_ride,
+    o.max_price/1000.0 max_price,o.customer_offer_price/1000.0 customer_offer_price,o.final_price/1000.0 final_price,o.female_driver_only,o.private_ride,o.requested_gender,
     CASE WHEN ${activeOnly} THEN c.name END customer_name,CASE WHEN ${activeOnly} THEN c.phone END customer_phone,
     CASE WHEN ${activeOnly} AND o.kind='STORE' THEN s.address END store_address,CASE WHEN ${activeOnly} THEN o.contact END contact
     FROM orders o JOIN "User" c ON c.id=o.customer_id LEFT JOIN stores s ON s.user_id=o.customer_id WHERE o.driver_id=? ORDER BY o.id DESC`, user.id);
@@ -508,7 +517,7 @@ export async function driverOfferList(userId: number): Promise<Record<string, un
   const activeOrder = await first<{ id: number }>("SELECT id FROM orders WHERE driver_id=? AND status NOT IN ('DELIVERED','CANCELLED') ORDER BY id DESC LIMIT 1", userId);
   const driverActiveOrderId = activeOrder ? Number(activeOrder.id) : null;
   const orders = await all<Record<string, unknown>>(`SELECT f.order_id,f.expires,f.distance_m,COALESCE(o.agreed_price,o.delivery_price) agreed_price,o.loyalty_reward_id,o.urgent,o.pickup,o.dropoff,o.pickup_name,o.dropoff_name,o.details,o.kind,o.order_value,o.is_paid,o.notes,
-    o.pickup_lat,o.pickup_lng,o.dropoff_lat,o.dropoff_lng,o.route_distance_m/1000.0 route_distance_km,o.max_price/1000.0 max_price,o.customer_offer_price/1000.0 customer_offer_price,o.female_driver_only,o.private_ride,
+    o.pickup_lat,o.pickup_lng,o.dropoff_lat,o.dropoff_lng,o.route_distance_m/1000.0 route_distance_km,o.max_price/1000.0 max_price,o.customer_offer_price/1000.0 customer_offer_price,o.final_price/1000.0 final_price,o.female_driver_only,o.private_ride,o.requested_gender,
     CASE WHEN o.kind='STORE' THEN s.store_name END store_name,CASE WHEN o.kind='STORE' THEN s.address END store_address
     FROM offers f JOIN orders o ON o.id=f.order_id LEFT JOIN stores s ON s.user_id=o.customer_id
     WHERE f.driver_id=? AND f.status='PENDING' AND o.status='SEARCHING_DRIVER' AND o.driver_id IS NULL AND (? IS NULL OR o.id<>?)
